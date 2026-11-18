@@ -35,7 +35,7 @@ These numbers come from Firebase's published Spark limits and are estimates. Che
 
 ## Set it up step by step
 
-You need a Google account, a GitHub account and about 30 minutes. Paths below are the current console menus.
+You need a Google account, a GitHub account and about 30 minutes. Firebase sometimes moves its menus. If a menu below isn't where the guide says, type the product name (for example "Firestore") into **Search for products** at the top of the left menu.
 
 ### 1. Create the Firebase project
 
@@ -44,14 +44,15 @@ You need a Google account, a GitHub account and about 30 minutes. Paths below ar
 
 ### 2. Turn on email sign-in
 
-1. **Build → Authentication → Get started**.
+1. **Security → Authentication → Get started** (left menu, under Product categories).
 2. **Sign-in method → Email/Password → Enable → Save**.
 
 ### 3. Create the database
 
-1. **Build → Firestore Database → Create database**.
+1. **Databases and storage → Firestore → Create database**. Make sure it says *Firestore*: **Realtime Database** and **Storage** are different products that this app doesn't use.
+   If asked for an edition, choose **Standard**.
 2. Choose a location close to your students. For the Philippines, **asia-southeast1 (Singapore)** is the closest. The location can't be changed later.
-3. Start in **production mode**. The app's own rules replace these in step 6.
+3. Start in **production mode** (the locked option). The app's own rules replace these in step 6.
 
 ### 4. Register the web app (public settings)
 
