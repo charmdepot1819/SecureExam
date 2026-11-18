@@ -1,0 +1,26 @@
+{
+  "name": "exam-online",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An LMS-style exam and quiz creator with educator mode, auto-grading, manual grading and a gradebook.",
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "seed": "node --no-warnings --experimental-strip-types scripts/seed.ts",
+    "test": "node --no-warnings --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "15.5.29",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.18.0",
+    "@types/react": "19.1.12",
+    "@types/react-dom": "19.1.9",
+    "typescript": "5.9.2"
+  }
+}
