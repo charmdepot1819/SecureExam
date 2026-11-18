@@ -11,7 +11,7 @@ import { baseUrl, grantLockdownPass, verifySebHeaders } from "@/lib/seb-access";
  */
 export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  const exam = getExam(Number(id));
+  const exam = await getExam(id);
   if (!exam) return new NextResponse("Not found", { status: 404 });
   const user = await currentUser();
   const path = `/exams/${exam.id}/lockdown${req.nextUrl.search}`;
@@ -29,7 +29,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
 (async function(){
   var m=document.getElementById('m');
   var url=location.href.split('#')[0];
-  var body={examId:${exam.id},url:url};
+  var body={examId:${JSON.stringify(exam.id)},url:url};
   function wait(ms){return new Promise(function(r){setTimeout(r,ms)})}
   try{
     var seb=window.SafeExamBrowser;

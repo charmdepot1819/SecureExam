@@ -1,8 +1,9 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { all, get } from "@/lib/db";
+import { getById } from "@/lib/db";
 import { requireTeacher } from "@/lib/auth";
-import { getExam, pct } from "@/lib/exam";
+import { attemptEvents, getAttempt, getExam, pct, type Attempt } from "@/lib/exam";
+import { where } from "@/lib/db";
 import { gradeAttempt, reopenAttempt } from "../../../actions";
 import AttemptView from "@/components/AttemptView";
 import When from "@/components/When";
@@ -31,13 +32,15 @@ const SERIOUS = ["tab_hidden", "window_blur", "fullscreen_exit", "devtools", "mu
 export default async function Grade({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ saved?: string }> }) {
   const { id } = await params;
   const sp = await searchParams;
-  const a = get("SELECT * FROM attempts WHERE id = ?", Number(id));
+  const a = await getAttempt(id);
   if (!a) notFound();
-  const exam = getExam(a.exam_id)!;
+  const exam = (await getExam(a.exam_id))!;
   await requireTeacher(exam.course_id);
-  const student = get("SELECT name, email FROM users WHERE id = ?", a.user_id);
-  const events = all("SELECT * FROM attempt_events WHERE attempt_id = ? ORDER BY id", a.id);
-  const nextUngraded = get("SELECT id FROM attempts WHERE exam_id = ? AND status = 'submitted' AND id != ? ORDER BY id LIMIT 1", exam.id, a.id);
+  const student = (await getById("users", a.user_id)) || { name: "(deleted user)", email: "" };
+  const events = await attemptEvents(a.id);
+  const nextUngraded = (await where<Attempt>("attempts", ["exam_id", "==", exam.id], ["status", "==", "submitted"]))
+    .filter((x) => x.id !== a.id)
+    .sort((x, y) => (x.submitted_at || "").localeCompare(y.submitted_at || ""))[0];
   const start = new Date(a.started_at).getTime();
   const rel = (iso: string) => {
     const s = Math.round((new Date(iso).getTime() - start) / 1000);

@@ -1,16 +1,15 @@
-import { all } from "@/lib/db";
-import { getQuestion, type LayoutEntry } from "@/lib/exam";
+import { getQuestions, responsesFor, type LayoutEntry } from "@/lib/exam";
 
 /** Renders an attempt's questions and the student's answers. Teachers get grading inputs. */
-export default function AttemptView({ attempt, showScores, showKey, grading }: { attempt: any; showScores: boolean; showKey: boolean; grading?: boolean }) {
+export default async function AttemptView({ attempt, showScores, showKey, grading }: { attempt: any; showScores: boolean; showKey: boolean; grading?: boolean }) {
   const layout: LayoutEntry[] = JSON.parse(attempt.layout_json);
-  const resp = all("SELECT * FROM responses WHERE attempt_id = ?", attempt.id);
+  const [resp, qs] = await Promise.all([responsesFor(attempt.id), getQuestions(layout.map((l) => l.qid))]);
   return (
     <>
       {layout.map((l, i) => {
-        const q = getQuestion(l.qid);
+        const q = qs.get(l.qid);
         if (!q) return null;
-        const r = resp.find((x: any) => x.question_id === q.id);
+        const r = resp.find((x) => x.question_id === q.id);
         const a = r?.answer_json ? JSON.parse(r.answer_json) : null;
         const byId = new Map(q.options.map((o) => [o.id, o]));
         const opts = l.opts.map((id) => byId.get(id)!).filter(Boolean);
@@ -40,7 +39,7 @@ export default function AttemptView({ attempt, showScores, showKey, grading }: {
             )}
             {q.type === "short" && showKey && <p className="muted">Accepted answers: {(q.answer?.accepted || []).join(" · ")}</p>}
             {q.type === "file" && (
-              <p>{r?.file_path ? <a href={`/api/files/${r.id}`}>Download {r.file_name}</a> : <span className="muted">No file uploaded</span>}</p>
+              <p>{r?.file_path ? <a href={`/api/files/${r.file_path}`}>Download {r.file_name}</a> : r?.file_purged ? <span className="muted">{r.file_name} (file deleted after grading to free storage)</span> : <span className="muted">No file uploaded</span>}</p>
             )}
             {q.type === "essay" && a?.text && <p className="muted" style={{ fontSize: "0.8rem" }}>{a.text.trim().split(/\s+/).length} words</p>}
             {showKey && q.feedback && <div className="notice" style={{ whiteSpace: "pre-wrap" }}><strong>Explanation:</strong> {q.feedback}</div>}

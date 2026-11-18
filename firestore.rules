@@ -1,0 +1,11 @@
+rules_version = '2';
+// Exam Online reads and writes Firestore only from its server (Firebase Admin SDK, which bypasses these rules).
+// Browsers get no direct access at all, so students can't read answer keys, other students' work, or change scores,
+// even with the public web config. Keep this deny-all unless you add client-side Firestore code on purpose.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

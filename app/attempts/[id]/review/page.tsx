@@ -1,19 +1,18 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
-import { get } from "@/lib/db";
 import { requireUser, courseRole } from "@/lib/auth";
-import { feedbackVisible, getExam, pct } from "@/lib/exam";
+import { feedbackVisible, getAttempt, getExam, pct } from "@/lib/exam";
 import AttemptView from "@/components/AttemptView";
 import When from "@/components/When";
 
 export default async function Review({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const u = await requireUser();
-  const a = get("SELECT * FROM attempts WHERE id = ?", Number(id));
+  const a = await getAttempt(id);
   if (!a) notFound();
-  const exam = getExam(a.exam_id)!;
+  const exam = (await getExam(a.exam_id))!;
   if (a.user_id !== u.id) {
-    if (courseRole(exam.course_id, u.id) === "teacher") redirect(`/attempts/${a.id}/grade`);
+    if ((await courseRole(exam.course_id, u.id)) === "teacher") redirect(`/attempts/${a.id}/grade`);
     notFound();
   }
   if (a.status === "in_progress") redirect(`/attempts/${a.id}`);

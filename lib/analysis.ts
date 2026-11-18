@@ -1,5 +1,5 @@
-import { all } from "./db";
-import { getQuestion, type LayoutEntry, type Question } from "./exam";
+import { where } from "./db";
+import { getQuestions, responsesFor, type Attempt, type LayoutEntry, type Question } from "./exam";
 
 function pearson(x: number[], y: number[]): number | null {
   const n = x.length;
@@ -29,23 +29,24 @@ export type ItemStat = {
  * Difficulty p = mean item score / max. Discrimination = correlation of item score with the rest-of-test score
  * (total minus this item), which avoids inflating r with the item's own contribution.
  */
-export function itemAnalysis(examId: number) {
-  const attempts = all(
-    `SELECT a.* FROM attempts a WHERE a.exam_id = ? AND a.status = 'graded'
-     AND a.id = (SELECT MIN(b.id) FROM attempts b WHERE b.exam_id = a.exam_id AND b.user_id = a.user_id AND b.status = 'graded')`,
-    examId
-  );
-  const perItem = new Map<number, { item: number[]; rest: number[]; choices: Record<string, number> }>();
+export async function itemAnalysis(examId: string) {
+  const graded = await where<Attempt>("attempts", ["exam_id", "==", examId], ["status", "==", "graded"]);
+  // First graded attempt per student.
+  const firstByUser = new Map<string, Attempt>();
+  for (const a of graded.sort((x, y) => x.started_at.localeCompare(y.started_at))) if (!firstByUser.has(a.user_id)) firstByUser.set(a.user_id, a);
+  const attempts = [...firstByUser.values()];
+  const perItem = new Map<string, { item: number[]; rest: number[]; choices: Record<string, number> }>();
   const totals: number[] = [];
-  for (const a of attempts) {
-    const resp = all("SELECT question_id, points_awarded, answer_json FROM responses WHERE attempt_id = ?", a.id);
-    const layout: LayoutEntry[] = JSON.parse(a.layout_json);
-    const total = resp.reduce((s: number, r: any) => s + (r.points_awarded || 0), 0);
+  const layouts = attempts.map((a) => JSON.parse(a.layout_json) as LayoutEntry[]);
+  const qs = await getQuestions(layouts.flat().map((l) => l.qid));
+  for (const [k, a] of attempts.entries()) {
+    const resp = await responsesFor(a.id);
+    const total = resp.reduce((s, r) => s + (r.points_awarded || 0), 0);
     totals.push(a.max_score ? total / a.max_score : 0);
-    for (const { qid } of layout) {
-      const q = getQuestion(qid);
+    for (const { qid } of layouts[k]) {
+      const q = qs.get(qid);
       if (!q || !q.points) continue;
-      const r = resp.find((x: any) => x.question_id === qid);
+      const r = resp.find((x) => x.question_id === qid);
       const pts = r?.points_awarded || 0;
       const e = perItem.get(qid) || { item: [], rest: [], choices: {} };
       e.item.push(pts / q.points);
@@ -56,7 +57,7 @@ export function itemAnalysis(examId: number) {
     }
   }
   const items: ItemStat[] = [...perItem.entries()].map(([qid, e]) => ({
-    q: getQuestion(qid)!,
+    q: qs.get(qid)!,
     n: e.item.length,
     difficulty: e.item.length ? e.item.reduce((a, b) => a + b, 0) / e.item.length : null,
     discrimination: pearson(e.item, e.rest),

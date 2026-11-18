@@ -1,16 +1,12 @@
 "use server";
 
-import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
-import { all, get, run, tx, UPLOAD_DIR } from "@/lib/db";
+import { fdb, getById, insert, remove, removeWhere, update, upsert, where, first, nowIso } from "@/lib/db";
 import {
-  createSession,
+  createSessionFromIdToken,
   destroySession,
-  hashPassword,
-  verifyPassword,
   requireUser,
   requireEducator,
   requireTeacher,
@@ -18,7 +14,10 @@ import {
   courseRole,
 } from "@/lib/auth";
 import {
+  EXAM_DEFAULTS,
   canStart,
+  examItems,
+  getAttempt,
   getExam,
   getQuestion,
   logEvent,
@@ -26,14 +25,18 @@ import {
   pastDeadline,
   DEADLINE_GRACE_MS,
   recomputeScore,
+  respId,
   saveAnswer,
   startAttempt,
   submitAttempt,
+  getQuestions,
+  type Attempt,
   type LayoutEntry,
   type QType,
 } from "@/lib/exam";
 import { hasLockdownPass, lockdownClient } from "@/lib/seb-access";
 import { hashQuitPassword } from "@/lib/seb";
+import { beginFile, putChunk, getFileMeta, deleteFile, purgeFiles, filesWhere, CHUNK_BYTES, MAX_FILE_MB, DEFAULT_FILE_MB } from "@/lib/files";
 
 const str = (f: FormData, k: string) => String(f.get(k) ?? "").trim();
 const num = (f: FormData, k: string) => {
@@ -52,37 +55,14 @@ const dt = (f: FormData, k: string) => {
 
 // ---------- Auth ----------
 
-export async function register(_: any, f: FormData) {
-  const name = str(f, "name");
-  const email = str(f, "email").toLowerCase();
-  const password = String(f.get("password") || "");
-  if (!name || !/^\S+@\S+\.\S+$/.test(email)) return { error: "Enter your name and a valid email." };
-  if (password.length < 8) return { error: "Password must be at least 8 characters." };
-  if (get("SELECT 1 FROM users WHERE email = ?", email)) return { error: "An account with that email already exists." };
-  // The very first account becomes an educator so a fresh install can be set up.
-  const first = !get("SELECT 1 FROM users LIMIT 1");
-  const { id } = run(
-    "INSERT INTO users (name, email, password_hash, is_educator) VALUES (?, ?, ?, ?)",
-    name,
-    email,
-    hashPassword(password),
-    first ? 1 : 0
-  );
-  await createSession(id);
-  redirect(safeNext(str(f, "next")));
-}
-
-export async function login(_: any, f: FormData) {
-  const email = str(f, "email").toLowerCase();
-  const password = String(f.get("password") || "");
-  const u = get("SELECT * FROM users WHERE email = ?", email);
-  if (!u || !verifyPassword(password, u.password_hash)) return { error: "Email or password is incorrect." };
-  await createSession(u.id);
-  redirect(safeNext(str(f, "next")));
-}
-
-function safeNext(n: string) {
-  return n.startsWith("/") && !n.startsWith("//") ? n : "/dashboard";
+/** Called by the sign-in/up form after Firebase Authentication succeeds in the browser. */
+export async function establishSession(idToken: string, name?: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    await createSessionFromIdToken(idToken, name);
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || "Sign-in failed") };
+  }
 }
 
 export async function logout() {
@@ -91,16 +71,16 @@ export async function logout() {
 }
 
 export async function toggleMode(f: FormData) {
-  await requireEducator();
-  await setMode(str(f, "mode") === "student" ? "student" : "educator");
+  const u = await requireEducator();
+  await setMode(u.id, str(f, "mode") === "student" ? "student" : "educator");
   redirect("/dashboard");
 }
 
 export async function setEducator(f: FormData) {
   const me = await requireEducator();
-  const uid = Number(str(f, "user_id"));
+  const uid = str(f, "user_id");
   if (uid === me.id) return;
-  run("UPDATE users SET is_educator = ? WHERE id = ?", bool(f, "value"), uid);
+  await update("users", uid, { is_educator: bool(f, "value") });
   revalidatePath("/admin/users");
 }
 
@@ -110,54 +90,45 @@ export async function createCourse(f: FormData) {
   const u = await requireEducator();
   const title = str(f, "title");
   if (!title) return;
-  const id = tx(() => {
-    const { id } = run("INSERT INTO courses (title, code, description, owner_id) VALUES (?, ?, ?, ?)", title, str(f, "code"), str(f, "description"), u.id);
-    run("INSERT INTO enrollments (course_id, user_id, role) VALUES (?, ?, 'teacher')", id, u.id);
-    run("INSERT INTO banks (course_id, title) VALUES (?, 'General')", id);
-    return id;
-  });
+  const id = await insert("courses", { title, code: str(f, "code"), description: str(f, "description"), owner_id: u.id, created_at: nowIso() });
+  await insert("enrollments", { course_id: id, user_id: u.id, role: "teacher" }, `${id}_${u.id}`);
+  await insert("banks", { course_id: id, title: "General" });
   redirect(`/courses/${id}`);
 }
 
 /** Tags users as students (or co-teachers) in a course. Accepts checkbox ids and/or a list of emails. */
 export async function tagUsers(f: FormData) {
-  const courseId = Number(str(f, "course_id"));
+  const courseId = str(f, "course_id");
   await requireTeacher(courseId);
   const role = str(f, "role") === "teacher" ? "teacher" : "student";
-  const ids = f.getAll("user_id").map(Number);
+  const ids = f.getAll("user_id").map(String);
   const emails = str(f, "emails").split(/[\s,;]+/).filter(Boolean);
   for (const e of emails) {
-    const u = get("SELECT id FROM users WHERE email = ?", e.toLowerCase());
+    const u = await first("users", ["email", "==", e.toLowerCase()]);
     if (u) ids.push(u.id);
   }
-  for (const id of ids) {
-    run(
-      `INSERT INTO enrollments (course_id, user_id, role) VALUES (?, ?, ?)
-       ON CONFLICT(course_id, user_id) DO UPDATE SET role = excluded.role`,
-      courseId,
-      id,
-      role
-    );
+  for (const id of new Set(ids)) {
+    if (await getById("users", id)) await upsert("enrollments", `${courseId}_${id}`, { course_id: courseId, user_id: id, role });
   }
   revalidatePath(`/courses/${courseId}/people`);
 }
 
 export async function untagUser(f: FormData) {
-  const courseId = Number(str(f, "course_id"));
+  const courseId = str(f, "course_id");
   const me = await requireTeacher(courseId);
-  const uid = Number(str(f, "user_id"));
+  const uid = str(f, "user_id");
   if (uid === me.id) return;
-  run("DELETE FROM enrollments WHERE course_id = ? AND user_id = ?", courseId, uid);
+  await remove("enrollments", `${courseId}_${uid}`);
   revalidatePath(`/courses/${courseId}/people`);
 }
 
 // ---------- Question banks & questions ----------
 
 export async function createBank(f: FormData) {
-  const courseId = Number(str(f, "course_id"));
+  const courseId = str(f, "course_id");
   await requireTeacher(courseId);
   const title = str(f, "title");
-  if (title) run("INSERT INTO banks (course_id, title) VALUES (?, ?)", courseId, title);
+  if (title) await insert("banks", { course_id: courseId, title });
   revalidatePath(`/courses/${courseId}/bank`);
 }
 
@@ -166,7 +137,7 @@ export async function createBank(f: FormData) {
  * If exam_id is given, the new question is also appended to that exam.
  */
 export async function saveQuestion(f: FormData) {
-  const courseId = Number(str(f, "course_id"));
+  const courseId = str(f, "course_id");
   await requireTeacher(courseId);
   const data = JSON.parse(String(f.get("payload")));
   const type = data.type as QType;
@@ -174,12 +145,12 @@ export async function saveQuestion(f: FormData) {
   let options: { id: string; text: string }[] = [];
   let answer: any = {};
   if (type === "mc" || type === "multi") {
-    options = (data.options || [])
+    const withKey = (data.options || [])
       .filter((o: any) => String(o.text || "").trim())
       .map((o: any) => ({ id: o.id || newOptionId(), text: String(o.text).trim(), correct: !!o.correct }));
-    const correct = options.filter((o: any) => o.correct).map((o) => o.id);
+    const correct = withKey.filter((o: any) => o.correct).map((o: any) => o.id);
     answer = type === "mc" ? { correct: correct[0] ?? null } : { correct };
-    options = options.map(({ id, text }) => ({ id, text }));
+    options = withKey.map(({ id, text }: any) => ({ id, text }));
   } else if (type === "tf") {
     options = [
       { id: "true", text: "True" },
@@ -189,344 +160,374 @@ export async function saveQuestion(f: FormData) {
   } else if (type === "short") {
     answer = { accepted: String(data.accepted || "").split("\n").map((s: string) => s.trim()).filter(Boolean) };
   } else if (type === "file") {
-    answer = { accept: String(data.accept || "").trim(), maxMb: Number(data.maxMb) || 20 };
+    answer = { accept: String(data.accept || "").trim(), maxMb: Math.max(1, Math.min(MAX_FILE_MB, Number(data.maxMb) || DEFAULT_FILE_MB)) };
   }
-  const bankId = data.bank_id ? Number(data.bank_id) : null;
-  const points = Math.max(0, Number(data.points) || 1);
-  let qid = Number(data.id) || 0;
+  const bankId = data.bank_id ? String(data.bank_id) : null;
+  if (bankId) {
+    const b = await getById("banks", bankId);
+    if (!b || b.course_id !== courseId) throw new Error("Bad bank");
+  }
+  const doc = {
+    course_id: courseId,
+    bank_id: bankId,
+    type,
+    prompt: String(data.prompt || ""),
+    options,
+    answer,
+    points: Math.max(0, Number(data.points) || 1),
+    feedback: String(data.feedback || ""),
+  };
+  const qid = data.id ? String(data.id) : "";
   if (qid) {
-    const q = getQuestion(qid);
+    const q = await getQuestion(qid);
     if (!q || q.course_id !== courseId) throw new Error("Not found");
-    run(
-      "UPDATE questions SET type=?, prompt=?, options_json=?, answer_json=?, points=?, feedback=?, bank_id=? WHERE id=?",
-      type,
-      String(data.prompt || ""),
-      JSON.stringify(options),
-      JSON.stringify(answer),
-      points,
-      String(data.feedback || ""),
-      bankId,
-      qid
-    );
+    await update("questions", qid, doc);
   } else {
-    qid = run(
-      "INSERT INTO questions (course_id, bank_id, type, prompt, options_json, answer_json, points, feedback) VALUES (?,?,?,?,?,?,?,?)",
-      courseId,
-      bankId,
-      type,
-      String(data.prompt || ""),
-      JSON.stringify(options),
-      JSON.stringify(answer),
-      points,
-      String(data.feedback || "")
-    ).id;
-    const examId = Number(str(f, "exam_id"));
-    if (examId) addItem(examId, { question_id: qid });
+    const newId = await insert("questions", { ...doc, created_at: nowIso() });
+    const examId = str(f, "exam_id");
+    if (examId) {
+      const exam = await getExam(examId);
+      if (exam?.course_id === courseId) await addItem(examId, { question_id: newId });
+    }
   }
   const back = str(f, "back");
-  redirect(back || `/courses/${courseId}/bank`);
+  redirect(back.startsWith("/") && !back.startsWith("//") ? back : `/courses/${courseId}/bank`);
 }
 
 export async function deleteQuestion(f: FormData) {
-  const courseId = Number(str(f, "course_id"));
+  const courseId = str(f, "course_id");
   await requireTeacher(courseId);
-  run("DELETE FROM questions WHERE id = ? AND course_id = ?", Number(str(f, "question_id")), courseId);
+  const qid = str(f, "question_id");
+  const q = await getQuestion(qid);
+  if (!q || q.course_id !== courseId) return;
+  await remove("questions", qid);
+  await removeWhere("exam_items", ["question_id", "==", qid]);
   revalidatePath(`/courses/${courseId}/bank`);
 }
 
 // ---------- Exams ----------
 
+async function teacherExam(f: FormData) {
+  const exam = await getExam(str(f, "exam_id"));
+  if (!exam) redirect("/dashboard");
+  const u = await requireTeacher(exam.course_id);
+  return { exam, u };
+}
+
 export async function createExam(f: FormData) {
-  const courseId = Number(str(f, "course_id"));
+  const courseId = str(f, "course_id");
   await requireTeacher(courseId);
-  const kind = ["quiz", "exam", "assignment"].includes(str(f, "kind")) ? str(f, "kind") : "quiz";
-  const { id } = run(
-    "INSERT INTO exams (course_id, title, kind, focus_policy, require_fullscreen, block_copy) VALUES (?, ?, ?, ?, ?, ?)",
-    courseId,
-    str(f, "title") || "Untitled",
+  const kind = (["quiz", "exam", "assignment"].includes(str(f, "kind")) ? str(f, "kind") : "quiz") as any;
+  const a = kind === "assignment";
+  const id = await insert("exams", {
+    ...EXAM_DEFAULTS,
+    course_id: courseId,
+    title: str(f, "title") || "Untitled",
     kind,
-    kind === "assignment" ? "off" : "submit",
-    kind === "assignment" ? 0 : 1,
-    kind === "assignment" ? 0 : 1
-  );
+    focus_policy: a ? "off" : "submit",
+    require_fullscreen: a ? 0 : 1,
+    block_copy: a ? 0 : 1,
+    created_at: nowIso(),
+  });
   redirect(`/exams/${id}/edit`);
 }
 
 export async function updateExamSettings(f: FormData) {
-  const examId = Number(str(f, "exam_id"));
-  const exam = getExam(examId)!;
-  await requireTeacher(exam.course_id);
+  const { exam } = await teacherExam(f);
   const fp = str(f, "focus_policy");
   const fm = str(f, "feedback_mode");
   const quitPw = String(f.get("seb_quit_password") || "");
-  run(
-    `UPDATE exams SET title=?, instructions=?, kind=?, time_limit_min=?, available_from=?, due_at=?, lock_at=?, allow_late=?,
-      max_attempts=?, shuffle_questions=?, shuffle_options=?, feedback_mode=?, show_correct=?, focus_policy=?, focus_warnings=?,
-      require_fullscreen=?, block_copy=?, one_at_a_time=?, lock_backtrack=?, require_pledge=?, require_lockdown=?, seb_extra_keys=?,
-      seb_quit_hash=?
-     WHERE id=?`,
-    str(f, "title") || "Untitled",
-    str(f, "instructions"),
-    ["quiz", "exam", "assignment"].includes(str(f, "kind")) ? str(f, "kind") : "quiz",
-    num(f, "time_limit_min") || null,
-    dt(f, "available_from"),
-    dt(f, "due_at"),
-    dt(f, "lock_at"),
-    bool(f, "allow_late"),
-    Math.max(0, num(f, "max_attempts") ?? 1),
-    bool(f, "shuffle_questions"),
-    bool(f, "shuffle_options"),
-    ["immediate", "after_due", "never"].includes(fm) ? fm : "after_due",
-    bool(f, "show_correct"),
-    ["off", "log", "submit"].includes(fp) ? fp : "submit",
-    Math.max(0, num(f, "focus_warnings") ?? 0),
-    bool(f, "require_fullscreen"),
-    bool(f, "block_copy"),
-    bool(f, "one_at_a_time"),
-    bool(f, "lock_backtrack"),
-    bool(f, "require_pledge"),
-    bool(f, "require_lockdown"),
-    str(f, "seb_extra_keys"),
-    f.get("seb_quit_clear") ? "" : quitPw ? hashQuitPassword(quitPw) : exam.seb_quit_hash,
-    examId
-  );
-  revalidatePath(`/exams/${examId}/edit`);
-  redirect(`/exams/${examId}/edit?saved=1`);
+  await update("exams", exam.id, {
+    title: str(f, "title") || "Untitled",
+    instructions: str(f, "instructions"),
+    kind: ["quiz", "exam", "assignment"].includes(str(f, "kind")) ? str(f, "kind") : "quiz",
+    time_limit_min: num(f, "time_limit_min") || null,
+    available_from: dt(f, "available_from"),
+    due_at: dt(f, "due_at"),
+    lock_at: dt(f, "lock_at"),
+    allow_late: bool(f, "allow_late"),
+    max_attempts: Math.max(0, num(f, "max_attempts") ?? 1),
+    shuffle_questions: bool(f, "shuffle_questions"),
+    shuffle_options: bool(f, "shuffle_options"),
+    feedback_mode: ["immediate", "after_due", "never"].includes(fm) ? fm : "after_due",
+    show_correct: bool(f, "show_correct"),
+    focus_policy: ["off", "log", "submit"].includes(fp) ? fp : "submit",
+    focus_warnings: Math.max(0, num(f, "focus_warnings") ?? 0),
+    require_fullscreen: bool(f, "require_fullscreen"),
+    block_copy: bool(f, "block_copy"),
+    one_at_a_time: bool(f, "one_at_a_time"),
+    lock_backtrack: bool(f, "lock_backtrack"),
+    require_pledge: bool(f, "require_pledge"),
+    require_lockdown: bool(f, "require_lockdown"),
+    seb_extra_keys: str(f, "seb_extra_keys"),
+    seb_quit_hash: f.get("seb_quit_clear") ? "" : quitPw ? hashQuitPassword(quitPw) : exam.seb_quit_hash,
+  });
+  revalidatePath(`/exams/${exam.id}/edit`);
+  redirect(`/exams/${exam.id}/edit?saved=1`);
 }
 
 export async function setPublished(f: FormData) {
-  const examId = Number(str(f, "exam_id"));
-  const exam = getExam(examId)!;
-  await requireTeacher(exam.course_id);
-  run("UPDATE exams SET published = ? WHERE id = ?", bool(f, "value"), examId);
-  revalidatePath(`/exams/${examId}/edit`);
+  const { exam } = await teacherExam(f);
+  await update("exams", exam.id, { published: bool(f, "value") });
+  revalidatePath(`/exams/${exam.id}/edit`);
 }
 
 export async function deleteExam(f: FormData) {
-  const examId = Number(str(f, "exam_id"));
-  const exam = getExam(examId)!;
-  await requireTeacher(exam.course_id);
-  run("DELETE FROM exams WHERE id = ?", examId);
+  const { exam } = await teacherExam(f);
+  const atts = await where<Attempt>("attempts", ["exam_id", "==", exam.id]);
+  for (const a of atts) {
+    const resp = await where("responses", ["attempt_id", "==", a.id]);
+    for (const r of resp) if (r.file_path) await deleteFile(r.file_path);
+    await removeWhere("responses", ["attempt_id", "==", a.id]);
+    await removeWhere("attempt_events", ["attempt_id", "==", a.id]);
+    await remove("attempts", a.id);
+  }
+  for (const f of await filesWhere(["exam_id", "==", exam.id])) await deleteFile(f.id); // incl. unfinished uploads
+  await removeWhere("exam_items", ["exam_id", "==", exam.id]);
+  await removeWhere("exam_assignees", ["exam_id", "==", exam.id]);
+  await remove("exams", exam.id);
   redirect(`/courses/${exam.course_id}`);
 }
 
-function addItem(examId: number, item: { question_id?: number; bank_id?: number; draw_count?: number }) {
-  const pos = (get<{ m: number }>("SELECT COALESCE(MAX(position), 0) AS m FROM exam_items WHERE exam_id = ?", examId)?.m || 0) + 1;
-  run(
-    "INSERT INTO exam_items (exam_id, position, question_id, bank_id, draw_count) VALUES (?, ?, ?, ?, ?)",
-    examId,
-    pos,
-    item.question_id ?? null,
-    item.bank_id ?? null,
-    item.draw_count ?? null
-  );
+async function addItem(examId: string, item: { question_id?: string; bank_id?: string; draw_count?: number }) {
+  const items = await examItems(examId);
+  const pos = (items.length ? Math.max(...items.map((i) => i.position)) : 0) + 1;
+  await insert("exam_items", {
+    exam_id: examId,
+    position: pos,
+    question_id: item.question_id ?? null,
+    bank_id: item.bank_id ?? null,
+    draw_count: item.draw_count ?? null,
+  });
 }
 
 export async function addExistingQuestions(f: FormData) {
-  const examId = Number(str(f, "exam_id"));
-  const exam = getExam(examId)!;
-  await requireTeacher(exam.course_id);
-  for (const q of f.getAll("question_id").map(Number)) {
-    const already = get("SELECT 1 FROM exam_items WHERE exam_id = ? AND question_id = ?", examId, q);
-    if (!already) addItem(examId, { question_id: q });
+  const { exam } = await teacherExam(f);
+  const items = await examItems(exam.id);
+  const qs = await getQuestions(f.getAll("question_id").map(String));
+  for (const q of qs.values()) {
+    if (q.course_id !== exam.course_id) continue;
+    if (!items.some((i) => i.question_id === q.id)) await addItem(exam.id, { question_id: q.id });
   }
-  revalidatePath(`/exams/${examId}/edit`);
+  revalidatePath(`/exams/${exam.id}/edit`);
 }
 
 export async function addRandomDraw(f: FormData) {
-  const examId = Number(str(f, "exam_id"));
-  const exam = getExam(examId)!;
-  await requireTeacher(exam.course_id);
-  const bankId = Number(str(f, "bank_id"));
-  const n = Math.max(1, num(f, "draw_count") || 1);
-  addItem(examId, { bank_id: bankId, draw_count: n });
-  revalidatePath(`/exams/${examId}/edit`);
+  const { exam } = await teacherExam(f);
+  const bank = await getById("banks", str(f, "bank_id"));
+  if (!bank || bank.course_id !== exam.course_id) return;
+  await addItem(exam.id, { bank_id: bank.id, draw_count: Math.max(1, num(f, "draw_count") || 1) });
+  revalidatePath(`/exams/${exam.id}/edit`);
 }
 
 export async function removeItem(f: FormData) {
-  const examId = Number(str(f, "exam_id"));
-  const exam = getExam(examId)!;
-  await requireTeacher(exam.course_id);
-  run("DELETE FROM exam_items WHERE id = ? AND exam_id = ?", Number(str(f, "item_id")), examId);
-  revalidatePath(`/exams/${examId}/edit`);
+  const { exam } = await teacherExam(f);
+  const it = await getById("exam_items", str(f, "item_id"));
+  if (it?.exam_id === exam.id) await remove("exam_items", it.id);
+  revalidatePath(`/exams/${exam.id}/edit`);
 }
 
 export async function moveItem(f: FormData) {
-  const examId = Number(str(f, "exam_id"));
-  const exam = getExam(examId)!;
-  await requireTeacher(exam.course_id);
-  const items = all<{ id: number }>("SELECT id FROM exam_items WHERE exam_id = ? ORDER BY position", examId);
-  const idx = items.findIndex((i) => i.id === Number(str(f, "item_id")));
+  const { exam } = await teacherExam(f);
+  const items = await examItems(exam.id);
+  const idx = items.findIndex((i) => i.id === str(f, "item_id"));
   const to = idx + (str(f, "dir") === "up" ? -1 : 1);
   if (idx < 0 || to < 0 || to >= items.length) return;
   [items[idx], items[to]] = [items[to], items[idx]];
-  tx(() => items.forEach((it, i) => run("UPDATE exam_items SET position = ? WHERE id = ?", i + 1, it.id)));
-  revalidatePath(`/exams/${examId}/edit`);
+  const b = fdb().batch();
+  items.forEach((it, i) => b.update(fdb().collection("exam_items").doc(it.id), { position: i + 1 }));
+  await b.commit();
+  revalidatePath(`/exams/${exam.id}/edit`);
 }
 
 export async function setAssignees(f: FormData) {
-  const examId = Number(str(f, "exam_id"));
-  const exam = getExam(examId)!;
-  await requireTeacher(exam.course_id);
+  const { exam } = await teacherExam(f);
   const assignAll = str(f, "assign_all") === "1" ? 1 : 0;
-  tx(() => {
-    run("UPDATE exams SET assign_all = ? WHERE id = ?", assignAll, examId);
-    run("DELETE FROM exam_assignees WHERE exam_id = ?", examId);
-    if (!assignAll) for (const u of f.getAll("user_id").map(Number)) run("INSERT INTO exam_assignees (exam_id, user_id) VALUES (?, ?)", examId, u);
-  });
-  revalidatePath(`/exams/${examId}/edit`);
+  await update("exams", exam.id, { assign_all: assignAll });
+  await removeWhere("exam_assignees", ["exam_id", "==", exam.id]);
+  if (!assignAll) {
+    for (const u of f.getAll("user_id").map(String)) await insert("exam_assignees", { exam_id: exam.id, user_id: u }, `${exam.id}_${u}`);
+  }
+  revalidatePath(`/exams/${exam.id}/edit`);
 }
 
 // ---------- Taking an exam ----------
 
 export async function beginAttempt(f: FormData) {
   const u = await requireUser();
-  const exam = getExam(Number(str(f, "exam_id")));
+  const exam = await getExam(str(f, "exam_id"));
   if (!exam) redirect("/dashboard");
-  const av = canStart(exam, u.id);
+  const av = await canStart(exam, u.id);
   if (!av.ok) redirect(`/exams/${exam.id}`);
   if (exam.require_lockdown && !(await hasLockdownPass(exam.id, u.id))) redirect(`/exams/${exam.id}?seb=required`);
   if (exam.require_pledge && !f.get("pledge")) redirect(`/exams/${exam.id}?pledge=required`);
-  const id = startAttempt(exam, u.id);
-  const client = await lockdownClient(exam.id, u.id);
-  run("UPDATE attempts SET client = ? WHERE id = ?", client, id);
-  if (exam.require_pledge) logEvent(id, "pledge", "Student affirmed the academic integrity statement");
+  const id = await startAttempt(exam, u.id, await lockdownClient(exam.id, u.id));
+  if (exam.require_pledge) await logEvent(id, "pledge", "Student affirmed the academic integrity statement");
   redirect(`/attempts/${id}`);
 }
 
-async function ownAttempt(attemptId: number) {
+async function ownAttempt(attemptId: string) {
   const u = await requireUser();
-  const a = get("SELECT * FROM attempts WHERE id = ?", attemptId);
+  const a = await getAttempt(attemptId);
   if (!a || a.user_id !== u.id) throw new Error("Not your attempt");
-  const exam = getExam(a.exam_id)!;
+  const exam = (await getExam(a.exam_id))!;
   if (exam.require_lockdown && !(await hasLockdownPass(exam.id, u.id))) throw new Error("Lockdown browser session required");
   return { u, a, exam };
 }
 
 /** Autosave of a single answer. Rejected after the deadline (plus a grace period for latency). */
-export async function saveResponse(attemptId: number, qid: number, answer: any): Promise<{ ok: boolean; error?: string }> {
+export async function saveResponse(attemptId: string, qid: string, answer: any): Promise<{ ok: boolean; error?: string }> {
   const { a } = await ownAttempt(attemptId);
   if (a.status !== "in_progress") return { ok: false, error: "This attempt is already submitted." };
   if (pastDeadline(a, DEADLINE_GRACE_MS)) {
-    submitAttempt(a.id, "time");
+    await submitAttempt(a.id, "time");
     return { ok: false, error: "Time is up. Your attempt was submitted." };
   }
   const layout: LayoutEntry[] = JSON.parse(a.layout_json);
   if (!layout.some((l) => l.qid === qid)) return { ok: false, error: "Question not in this attempt." };
-  saveAnswer(a.id, qid, answer);
+  await saveAnswer(a.id, qid, answer);
   return { ok: true };
 }
 
-export async function uploadResponseFile(f: FormData): Promise<{ ok: boolean; error?: string; name?: string }> {
-  const attemptId = Number(str(f, "attempt_id"));
-  const qid = Number(str(f, "question_id"));
-  const { a } = await ownAttempt(attemptId);
+/**
+ * Uploads: the browser calls startUpload, then sends the file in ≤ 900 KB pieces with uploadChunk.
+ * Files are stored in Firestore (see lib/files.ts) so the app stays on the free Spark plan, and each request
+ * stays far under Vercel Hobby's 4.5 MB body limit.
+ */
+export async function startUpload(attemptId: string, qid: string, name: string, size: number): Promise<{ ok: boolean; error?: string; fileId?: string; chunkBytes?: number }> {
+  const { a, exam } = await ownAttempt(attemptId);
   if (a.status !== "in_progress") return { ok: false, error: "This attempt is already submitted." };
   if (pastDeadline(a, DEADLINE_GRACE_MS)) return { ok: false, error: "Time is up." };
   const layout: LayoutEntry[] = JSON.parse(a.layout_json);
   if (!layout.some((l) => l.qid === qid)) return { ok: false, error: "Question not in this attempt." };
-  const q = getQuestion(qid)!;
-  const file = f.get("file") as File | null;
-  if (!file || file.size === 0) return { ok: false, error: "Choose a file first." };
-  const maxMb = Number(q.answer?.maxMb) || 20;
-  if (file.size > maxMb * 1024 * 1024) return { ok: false, error: `File is larger than ${maxMb} MB.` };
-  const accept = String(q.answer?.accept || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-  const ext = path.extname(file.name).toLowerCase();
+  const q = (await getQuestion(qid))!;
+  if (q.type !== "file") return { ok: false, error: "This question doesn't take files." };
+  if (!size) return { ok: false, error: "Choose a file first." };
+  const maxMb = Math.min(MAX_FILE_MB, Number(q.answer?.maxMb) || DEFAULT_FILE_MB);
+  if (size > maxMb * 1024 * 1024) return { ok: false, error: `File is larger than ${maxMb} MB. Try a PDF or a smaller photo.` };
+  const accept = String(q.answer?.accept || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  const ext = path.extname(name).toLowerCase();
   if (accept.length && !accept.includes(ext)) return { ok: false, error: `Allowed file types: ${accept.join(", ")}` };
-  const stored = `${a.id}-${qid}-${crypto.randomBytes(6).toString("hex")}${ext.replace(/[^.a-z0-9]/g, "")}`;
-  fs.writeFileSync(path.join(UPLOAD_DIR, stored), Buffer.from(await file.arrayBuffer()));
-  const prev = get("SELECT file_path FROM responses WHERE attempt_id = ? AND question_id = ?", a.id, qid);
-  run(
-    `INSERT INTO responses (attempt_id, question_id, file_path, file_name) VALUES (?, ?, ?, ?)
-     ON CONFLICT(attempt_id, question_id) DO UPDATE SET file_path = excluded.file_path, file_name = excluded.file_name`,
-    a.id,
-    qid,
-    stored,
-    file.name.slice(0, 200)
-  );
-  if (prev?.file_path) fs.rm(path.join(UPLOAD_DIR, prev.file_path), () => {});
-  return { ok: true, name: file.name };
+  const fileId = await beginFile({ owner_id: a.user_id, attempt_id: a.id, question_id: qid, course_id: exam.course_id, exam_id: exam.id, name: name.slice(0, 200), size, chunks: Math.ceil(size / CHUNK_BYTES) });
+  return { ok: true, fileId, chunkBytes: CHUNK_BYTES };
 }
+
+export async function uploadChunk(f: FormData): Promise<{ ok: boolean; error?: string; done?: boolean; name?: string }> {
+  const u = await requireUser();
+  const meta = await getFileMeta(str(f, "file_id"));
+  if (!meta || meta.owner_id !== u.id || meta.complete) return { ok: false, error: "Upload not found." };
+  const { a } = await ownAttempt(meta.attempt_id);
+  if (a.status !== "in_progress") return { ok: false, error: "This attempt is already submitted." };
+  const index = Number(str(f, "index"));
+  const blob = f.get("chunk") as File | null;
+  if (!blob || !Number.isInteger(index) || index < 0 || index >= meta.chunks) return { ok: false, error: "Bad upload piece." };
+  const done = await putChunk(meta.id, index, Buffer.from(await blob.arrayBuffer()));
+  if (done) {
+    const rid = respId(a.id, meta.question_id);
+    const prev = await getById("responses", rid);
+    await upsert("responses", rid, { attempt_id: a.id, question_id: meta.question_id, file_path: meta.id, file_name: meta.name });
+    if (prev?.file_path && prev.file_path !== meta.id) await deleteFile(prev.file_path);
+  }
+  return { ok: true, done, name: meta.name };
+}
+
+const COUNTING = ["tab_hidden", "window_blur", "fullscreen_exit"];
+const ALLOWED_EVENTS = ["tab_hidden", "window_blur", "fullscreen_exit", "copy_blocked", "paste_blocked", "context_menu", "devtools", "key_blocked", "print_blocked", "resume", "file_picker", "page_reload", "multi_tab"];
 
 /**
  * Integrity events reported by the exam page (tab hidden, window blur, fullscreen exit, copy/paste attempt, devtools).
- * Server decides whether the focus-loss policy forces submission.
+ * The server decides whether the focus-loss policy forces submission; the count is kept server-side.
  */
-export async function reportIntegrityEvent(attemptId: number, type: string, detail: string): Promise<{ submitted: boolean; remaining: number }> {
+export async function reportIntegrityEvent(attemptId: string, type: string, detail: string): Promise<{ submitted: boolean; remaining: number }> {
   const { a, exam } = await ownAttempt(attemptId);
   if (a.status !== "in_progress") return { submitted: true, remaining: 0 };
-  const allowed = ["tab_hidden", "window_blur", "fullscreen_exit", "copy_blocked", "paste_blocked", "context_menu", "devtools", "key_blocked", "print_blocked", "resume", "file_picker", "page_reload", "multi_tab"];
-  const t = allowed.includes(type) ? type : "other";
-  logEvent(a.id, t, detail);
-  const counts = ["tab_hidden", "window_blur", "fullscreen_exit"].includes(t);
-  if (!counts || exam.focus_policy === "off") return { submitted: false, remaining: -1 };
-  run("UPDATE attempts SET focus_losses = focus_losses + 1 WHERE id = ?", a.id);
-  const losses = (a.focus_losses || 0) + 1;
+  const t = ALLOWED_EVENTS.includes(type) ? type : "other";
+  await logEvent(a.id, t, detail);
+  if (!COUNTING.includes(t) || exam.focus_policy === "off") return { submitted: false, remaining: -1 };
+  const ref = fdb().collection("attempts").doc(a.id);
+  const losses = await fdb().runTransaction(async (tr) => {
+    const n = ((await tr.get(ref)).data()?.focus_losses || 0) + 1;
+    tr.update(ref, { focus_losses: n });
+    return n;
+  });
   if (exam.focus_policy === "submit" && losses > exam.focus_warnings) {
-    submitAttempt(a.id, "focus");
+    await submitAttempt(a.id, "focus");
     return { submitted: true, remaining: 0 };
   }
   return { submitted: false, remaining: exam.focus_policy === "submit" ? exam.focus_warnings - losses + 1 : -1 };
 }
 
-export async function finishAttempt(attemptId: number, reason: "student" | "time") {
+export async function finishAttempt(attemptId: string, reason: "student" | "time") {
   const { a } = await ownAttempt(attemptId);
-  if (a.status === "in_progress") submitAttempt(a.id, reason);
+  if (a.status === "in_progress") await submitAttempt(a.id, reason);
   return { ok: true };
 }
 
 // ---------- Grading ----------
 
 export async function gradeAttempt(f: FormData) {
-  const attemptId = Number(str(f, "attempt_id"));
-  const a = get("SELECT * FROM attempts WHERE id = ?", attemptId);
-  const exam = getExam(a.exam_id)!;
-  await requireTeacher(exam.course_id);
-  if (a.status === "in_progress") submitAttempt(a.id, "teacher");
+  const attemptId = str(f, "attempt_id");
+  const a = await getAttempt(attemptId);
+  if (!a) redirect("/dashboard");
+  await requireTeacher(a.course_id);
+  if (a.status === "in_progress") await submitAttempt(a.id, "teacher");
   const layout: LayoutEntry[] = JSON.parse(a.layout_json);
-  tx(() => {
-    for (const { qid } of layout) {
-      const q = getQuestion(qid);
-      if (!q) continue;
-      const raw = str(f, `points_${qid}`);
-      const fb = str(f, `feedback_${qid}`);
-      const pts = raw === "" ? null : Math.min(q.points, Math.max(0, Number(raw)));
-      run(
-        `INSERT INTO responses (attempt_id, question_id, points_awarded, feedback) VALUES (?, ?, ?, ?)
-         ON CONFLICT(attempt_id, question_id) DO UPDATE SET points_awarded = excluded.points_awarded, feedback = excluded.feedback`,
-        a.id,
-        qid,
-        pts,
-        fb
-      );
-    }
-    run("UPDATE attempts SET overall_feedback = ? WHERE id = ?", str(f, "overall_feedback"), a.id);
-  });
-  recomputeScore(a.id);
+  const qs = await getQuestions(layout.map((l) => l.qid));
+  const b = fdb().batch();
+  for (const { qid } of layout) {
+    const q = qs.get(qid);
+    if (!q) continue;
+    const raw = str(f, `points_${qid}`);
+    const pts = raw === "" ? null : Math.min(q.points, Math.max(0, Number(raw)));
+    b.set(
+      fdb().collection("responses").doc(respId(a.id, qid)),
+      { attempt_id: a.id, question_id: qid, points_awarded: pts, feedback: str(f, `feedback_${qid}`) },
+      { merge: true }
+    );
+  }
+  b.update(fdb().collection("attempts").doc(a.id), { overall_feedback: str(f, "overall_feedback") });
+  await b.commit();
+  await recomputeScore(a.id);
   const next = str(f, "next");
-  redirect(next || `/attempts/${a.id}/grade?saved=1`);
+  redirect(next.startsWith("/attempts/") ? next : `/attempts/${a.id}/grade?saved=1`);
 }
 
 /** Lets a teacher re-open an attempt that was force-submitted (e.g. a false-positive focus loss). */
 export async function reopenAttempt(f: FormData) {
-  const attemptId = Number(str(f, "attempt_id"));
-  const a = get("SELECT * FROM attempts WHERE id = ?", attemptId);
-  const exam = getExam(a.exam_id)!;
-  const me = await requireTeacher(exam.course_id);
+  const a = await getAttempt(str(f, "attempt_id"));
+  if (!a) redirect("/dashboard");
+  const me = await requireTeacher(a.course_id);
+  const exam = (await getExam(a.exam_id))!;
   const extra = Math.max(1, num(f, "extra_minutes") || 10);
   const deadline = exam.time_limit_min || exam.lock_at ? new Date(Date.now() + extra * 60000).toISOString() : null;
-  run(
-    "UPDATE attempts SET status = 'in_progress', submitted_at = NULL, submit_reason = NULL, score = NULL, deadline_at = ?, focus_losses = 0 WHERE id = ?",
-    deadline,
-    a.id
-  );
-  logEvent(a.id, "reopened", `Reopened by ${me.name}${deadline ? ` with ${extra} more minutes` : ""}`);
+  await update("attempts", a.id, { status: "in_progress", submitted_at: null, submit_reason: null, score: null, deadline_at: deadline, focus_losses: 0 });
+  await logEvent(a.id, "reopened", `Reopened by ${me.name}${deadline ? ` with ${extra} more minutes` : ""}`);
   redirect(`/attempts/${a.id}/grade`);
 }
 
-export async function ensureCourseAccess(courseId: number) {
+/** Deletes uploaded files from this exam's graded attempts. Grades and feedback stay. */
+export async function purgeExamFiles(f: FormData) {
+  const { exam } = await teacherExam(f);
+  const graded = new Set((await where("attempts", ["exam_id", "==", exam.id], ["status", "==", "graded"])).map((a: any) => a.id));
+  const files = (await filesWhere(["exam_id", "==", exam.id])).filter((x) => graded.has(x.attempt_id));
+  const r = await purgeFiles(files);
+  revalidatePath(`/exams/${exam.id}/submissions`);
+  redirect(`/exams/${exam.id}/submissions?purged=${r.count}`);
+}
+
+/** End of term: deletes every uploaded file in the course. Grades and feedback stay. */
+export async function purgeCourseFiles(f: FormData) {
+  const courseId = str(f, "course_id");
+  await requireTeacher(courseId);
+  if (str(f, "confirm").trim().toUpperCase() !== "DELETE") redirect(`/courses/${courseId}?purge=confirm`);
+  const r = await purgeFiles(await filesWhere(["course_id", "==", courseId]));
+  revalidatePath(`/courses/${courseId}`);
+  redirect(`/courses/${courseId}?purged=${r.count}`);
+}
+
+export async function ensureCourseAccess(courseId: string) {
   const u = await requireUser();
-  const role = courseRole(courseId, u.id);
+  const role = await courseRole(courseId, u.id);
   if (!role) redirect("/dashboard");
   return { u, role };
 }

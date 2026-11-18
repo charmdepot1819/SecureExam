@@ -17,7 +17,7 @@ export default function QuestionPreview({ q }: { q: Question }) {
         </ul>
       )}
       {q.type === "short" && <p className="muted">Accepted: {(q.answer?.accepted || []).join(" · ")}</p>}
-      {q.type === "file" && <p className="muted">Upload: {q.answer?.accept || "any type"}, up to {q.answer?.maxMb || 20} MB</p>}
+      {q.type === "file" && <p className="muted">Upload: {q.answer?.accept || "any type"}, up to {q.answer?.maxMb || 2} MB</p>}
     </div>
   );
 }

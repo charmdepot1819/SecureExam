@@ -1,19 +1,18 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { get } from "@/lib/db";
+import { getById } from "@/lib/db";
 import { ensureCourseAccess } from "../../../actions";
 import CourseTabs from "@/components/CourseTabs";
 import { gradebook } from "@/lib/gradebook";
-import { feedbackVisible, pct, sweepExpired } from "@/lib/exam";
+import { feedbackVisible, pct } from "@/lib/exam";
 
 export default async function Gradebook({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const course = get("SELECT * FROM courses WHERE id = ?", Number(id));
+  const course = await getById("courses", id);
   if (!course) notFound();
   const { u, role } = await ensureCourseAccess(course.id);
-  sweepExpired();
   const teacher = role === "teacher";
-  const { exams, rows } = gradebook(course.id, teacher ? undefined : u.id);
+  const { exams, rows } = await gradebook(course.id, teacher ? undefined : u.id);
   return (
     <main className="wrap" style={{ maxWidth: 1200 }}>
       <CourseTabs course={course} active="gradebook" teacher={teacher} />

@@ -1,10 +1,10 @@
-import { all } from "@/lib/db";
+import { allDocs } from "@/lib/db";
 import { requireEducator } from "@/lib/auth";
 import { setEducator } from "../../actions";
 
 export default async function Users() {
   const me = await requireEducator();
-  const users = all("SELECT id, name, email, is_educator, created_at FROM users ORDER BY name");
+  const users = (await allDocs("users", 2000)).sort((a: any, b: any) => a.name.localeCompare(b.name));
   return (
     <main className="wrap">
       <h1>Users</h1>

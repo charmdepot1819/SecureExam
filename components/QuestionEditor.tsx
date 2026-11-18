@@ -13,10 +13,10 @@ const TYPES: [string, string][] = [
 ];
 
 export default function QuestionEditor(props: {
-  courseId: number;
-  banks: { id: number; title: string }[];
+  courseId: string;
+  banks: { id: string; title: string }[];
   initial?: any;
-  examId?: number;
+  examId?: string;
   back: string;
 }) {
   const q = props.initial;
@@ -37,7 +37,7 @@ export default function QuestionEditor(props: {
   const [tf, setTf] = useState<string>(q?.type === "tf" ? q.answer?.correct || "true" : "true");
   const [accepted, setAccepted] = useState<string>(q?.type === "short" ? (q.answer?.accepted || []).join("\n") : "");
   const [accept, setAccept] = useState<string>(q?.type === "file" ? q.answer?.accept || "" : ".pdf,.docx,.jpg,.png");
-  const [maxMb, setMaxMb] = useState<number>(q?.type === "file" ? q.answer?.maxMb || 20 : 20);
+  const [maxMb, setMaxMb] = useState<number>(q?.type === "file" ? q.answer?.maxMb || 2 : 2);
   const [err, setErr] = useState("");
 
   const payload = JSON.stringify({ id: q?.id, type, prompt, points, bank_id: bankId || null, feedback, options, tf, accepted, accept, maxMb });
@@ -137,8 +137,8 @@ export default function QuestionEditor(props: {
             <input id="accept" type="text" value={accept} onChange={(e) => setAccept(e.target.value)} />
           </div>
           <div>
-            <label htmlFor="maxmb">Max size (MB)</label>
-            <input id="maxmb" type="number" min={1} max={25} value={maxMb} onChange={(e) => setMaxMb(Number(e.target.value))} />
+            <label htmlFor="maxmb">Max size (MB) <span className="hint">2 MB fits a phone photo or a typical PDF. Photos are shrunk on the phone before upload. Raise it only if needed: the free plan stores 1 GB in total.</span></label>
+            <input id="maxmb" type="number" min={1} max={10} value={maxMb} onChange={(e) => setMaxMb(Number(e.target.value))} />
           </div>
         </div>
       )}

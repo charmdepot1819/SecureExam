@@ -1,5 +1,5 @@
 import { notFound } from "next/navigation";
-import { get, all } from "@/lib/db";
+import { allDocs, getMany, getById, where } from "@/lib/db";
 import { requireTeacher } from "@/lib/auth";
 import { tagUsers, untagUser } from "../../../actions";
 import CourseTabs from "@/components/CourseTabs";
@@ -7,19 +7,23 @@ import CourseTabs from "@/components/CourseTabs";
 export default async function People({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ q?: string }> }) {
   const { id } = await params;
   const { q = "" } = await searchParams;
-  const course = get("SELECT * FROM courses WHERE id = ?", Number(id));
+  const course = await getById("courses", id);
   if (!course) notFound();
   const me = await requireTeacher(course.id);
-  const members = all(
-    `SELECT u.id, u.name, u.email, e.role FROM enrollments e JOIN users u ON u.id = e.user_id WHERE e.course_id = ? ORDER BY e.role DESC, u.name`,
-    course.id
-  );
-  const like = `%${q}%`;
-  const others = all(
-    `SELECT id, name, email FROM users WHERE id NOT IN (SELECT user_id FROM enrollments WHERE course_id = ?)
-     AND (name LIKE ? OR email LIKE ?) ORDER BY name LIMIT 100`,
-    course.id, like, like
-  );
+  const enr = await where("enrollments", ["course_id", "==", course.id]);
+  const byId = await getMany<any>("users", enr.map((e: any) => e.user_id));
+  // The tagging list reads user accounts only when the teacher searches, to save free-tier reads.
+  const users: any[] = q ? await allDocs("users", 2000) : [];
+  const members = enr
+    .map((e: any) => ({ ...byId.get(e.user_id), id: e.user_id, role: e.role }))
+    .filter((m: any) => m.email)
+    .sort((a: any, b: any) => (a.role === b.role ? a.name.localeCompare(b.name) : a.role === "teacher" ? -1 : 1));
+  const enrolled = new Set(enr.map((e: any) => e.user_id));
+  const needle = q.toLowerCase();
+  const others = users
+    .filter((u: any) => !enrolled.has(u.id) && (!needle || u.name.toLowerCase().includes(needle) || u.email.includes(needle)))
+    .sort((a: any, b: any) => a.name.localeCompare(b.name))
+    .slice(0, 100);
   return (
     <main className="wrap">
       <CourseTabs course={course} active="people" teacher />
@@ -32,7 +36,7 @@ export default async function People({ params, searchParams }: { params: Promise
         </form>
         <form action={tagUsers}>
           <input type="hidden" name="course_id" value={course.id} />
-          {others.length === 0 ? <p className="muted">No untagged users match.</p> : (
+          {!q ? <p className="muted">Search by name or email to find accounts, or paste emails below.</p> : others.length === 0 ? <p className="muted">No untagged users match.</p> : (
             <div style={{ maxHeight: 320, overflow: "auto", border: "1px solid var(--border)", borderRadius: 8, padding: "0 0.75rem" }}>
               {others.map((o: any) => (
                 <label key={o.id} className="inline"><input type="checkbox" name="user_id" value={o.id} /> {o.name} <span className="muted">{o.email}</span></label>

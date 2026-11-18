@@ -8,7 +8,7 @@ export async function POST(req: NextRequest) {
   const user = await currentUser();
   if (!user) return NextResponse.json({ ok: false, error: "Not signed in" }, { status: 401 });
   const body = await req.json().catch(() => ({}));
-  const exam = getExam(Number(body.examId));
+  const exam = await getExam(String(body.examId));
   if (!exam) return NextResponse.json({ ok: false }, { status: 404 });
   const base = await baseUrl();
   const url = String(body.url || "").split("#")[0];

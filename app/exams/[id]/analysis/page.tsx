@@ -16,10 +16,10 @@ function dLabel(r: number | null) {
 
 export default async function Analysis({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const exam = getExam(Number(id));
+  const exam = await getExam(id);
   if (!exam) notFound();
   await requireTeacher(exam.course_id);
-  const { n, mean, items } = itemAnalysis(exam.id);
+  const { n, mean, items } = await itemAnalysis(exam.id);
   return (
     <main className="wrap">
       <div className="muted" style={{ fontSize: "0.85rem" }}><Link href={`/exams/${exam.id}/submissions`}>{exam.title}: submissions</Link></div>

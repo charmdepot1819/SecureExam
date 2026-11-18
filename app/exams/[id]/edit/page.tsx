@@ -1,8 +1,8 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { all, get } from "@/lib/db";
+import { getMany, getById, where } from "@/lib/db";
 import { requireTeacher } from "@/lib/auth";
-import { examQuestionCount, getExam, getQuestion, rowToQuestion } from "@/lib/exam";
+import { examItems, getExam, getQuestions, rowToQuestion } from "@/lib/exam";
 import {
   addExistingQuestions,
   addRandomDraw,
@@ -23,20 +23,24 @@ import { configKey } from "@/lib/seb";
 export default async function EditExam({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ add?: string; saved?: string }> }) {
   const { id } = await params;
   const sp = await searchParams;
-  const exam = getExam(Number(id));
+  const exam = await getExam(id);
   if (!exam) notFound();
   await requireTeacher(exam.course_id);
-  const course = get("SELECT * FROM courses WHERE id = ?", exam.course_id);
-  const banks = all("SELECT b.*, (SELECT COUNT(*) FROM questions q WHERE q.bank_id = b.id) AS n FROM banks b WHERE course_id = ? ORDER BY title", exam.course_id);
-  const items = all("SELECT * FROM exam_items WHERE exam_id = ? ORDER BY position", exam.id);
-  const usedIds = items.filter((i: any) => i.question_id).map((i: any) => i.question_id);
-  const bankQs = all("SELECT * FROM questions WHERE course_id = ? ORDER BY bank_id, id", exam.course_id).map(rowToQuestion).filter((q) => !usedIds.includes(q.id));
-  const students = all("SELECT u.id, u.name, u.email FROM enrollments e JOIN users u ON u.id = e.user_id WHERE e.course_id = ? AND e.role = 'student' ORDER BY u.name", exam.course_id);
-  const assigned = all<{ user_id: number }>("SELECT user_id FROM exam_assignees WHERE exam_id = ?", exam.id).map((r) => r.user_id);
-  const total = items.reduce((s: number, it: any) => {
-    if (it.question_id) return s + (getQuestion(it.question_id)?.points || 0);
-    return s;
-  }, 0);
+  const course = (await getById("courses", exam.course_id))!;
+  const allQs = (await where("questions", ["course_id", "==", exam.course_id])).map(rowToQuestion);
+  const banks = (await where("banks", ["course_id", "==", exam.course_id]))
+    .map((b: any) => ({ id: b.id, title: b.title, n: allQs.filter((q) => q.bank_id === b.id).length }))
+    .sort((a, b) => a.title.localeCompare(b.title));
+  const items = await examItems(exam.id);
+  const qmap = await getQuestions(items.map((i) => i.question_id!).filter(Boolean));
+  const usedIds = items.filter((i) => i.question_id).map((i) => i.question_id);
+  const bankQs = allQs.filter((q) => !usedIds.includes(q.id)).sort((a, b) => (a.bank_id || "").localeCompare(b.bank_id || ""));
+  const studentIds = (await where("enrollments", ["course_id", "==", exam.course_id], ["role", "==", "student"])).map((e: any) => e.user_id);
+  const userMap = await getMany("users", studentIds);
+  const students = studentIds.map((sid: string) => userMap.get(sid)).filter(Boolean).sort((a: any, b: any) => a.name.localeCompare(b.name));
+  const assigned = (await where("exam_assignees", ["exam_id", "==", exam.id])).map((r: any) => r.user_id);
+  const total = items.reduce((s, it) => s + (it.question_id ? qmap.get(it.question_id)?.points || 0 : 0), 0);
+  const perStudent = items.reduce((n, r) => n + (r.question_id ? 1 : r.draw_count || 0), 0);
   const hasDraws = items.some((i: any) => i.bank_id);
   const back = `/exams/${exam.id}/edit`;
   const base = await baseUrl();
@@ -66,18 +70,18 @@ export default async function EditExam({ params, searchParams }: { params: Promi
       <section className="card">
         <div className="spread">
           <h2 style={{ margin: 0 }}>Questions</h2>
-          <span className="muted">{examQuestionCount(exam.id)} per student{hasDraws ? "" : ` · ${total} pts`}</span>
+          <span className="muted">{perStudent} per student{hasDraws ? "" : ` · ${total} pts`}</span>
         </div>
         <ol className="list" style={{ marginTop: "0.5rem" }}>
           {items.map((it: any, i: number) => {
-            const q = it.question_id ? getQuestion(it.question_id) : null;
+            const q = it.question_id ? qmap.get(it.question_id) : null;
             const bank = it.bank_id ? banks.find((b: any) => b.id === it.bank_id) : null;
             return (
               <li key={it.id}>
                 <div className="muted" style={{ fontSize: "0.8rem" }}>Item {i + 1}</div>
                 {q ? <QuestionPreview q={q} /> : (
                   <p><strong>Random draw:</strong> {it.draw_count} question{it.draw_count === 1 ? "" : "s"} from “{bank?.title}” ({bank?.n ?? 0} in bank)
-                    {bank && bank.n < it.draw_count && <span className="badge danger" style={{ marginLeft: 6 }}>bank too small</span>}</p>
+                    {bank && bank.n < (it.draw_count || 0) && <span className="badge danger" style={{ marginLeft: 6 }}>bank too small</span>}</p>
                 )}
                 <div className="row" style={{ marginTop: "0.3rem" }}>
                   {[["up", "↑"], ["down", "↓"]].map(([d, l]) => (

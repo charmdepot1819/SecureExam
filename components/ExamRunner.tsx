@@ -1,9 +1,9 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { finishAttempt, saveResponse, uploadResponseFile } from "@/app/actions";
+import { finishAttempt, saveResponse, startUpload, uploadChunk } from "@/app/actions";
 
 type Q = {
-  id: number;
+  id: string;
   type: "mc" | "multi" | "tf" | "short" | "essay" | "file";
   prompt: string;
   points: number;
@@ -38,9 +38,42 @@ function answered(q: Q, a: any, fileName: string | null) {
   return a.choice != null;
 }
 
+/**
+ * Phone photos are often 3 to 8 MB. Before upload, re-encode large photos as JPEG at most 1600 px on the
+ * long side (still readable for handwriting and lab photos), which usually gives 200 to 600 KB.
+ * Only done when JPEG is an allowed type; if anything fails, the original file is sent.
+ */
+async function shrinkImage(file: File, accept: string): Promise<File> {
+  if (!/^image\/(jpeg|png|webp|heic|heif)$/i.test(file.type) || file.size <= 500 * 1024) return file;
+  const allowed = accept.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  const ext = !allowed.length || allowed.includes(".jpg") ? ".jpg" : allowed.includes(".jpeg") ? ".jpeg" : null;
+  if (!ext) return file;
+  const url = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode(); // <img> applies the photo's EXIF rotation when drawn
+    const scale = Math.min(1, 1600 / Math.max(img.naturalWidth, img.naturalHeight));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(img.naturalWidth * scale);
+    canvas.height = Math.round(img.naturalHeight * scale);
+    const ctx = canvas.getContext("2d")!;
+    ctx.fillStyle = "#fff"; // transparent PNG areas become white, not black
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, "image/jpeg", 0.8));
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], file.name.replace(/\.[^.]*$/, "") + ext, { type: "image/jpeg" });
+  } catch {
+    return file;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 export default function ExamRunner(props: {
-  attemptId: number;
-  examId: number;
+  attemptId: string;
+  examId: string;
   title: string;
   studentLabel: string;
   deadline: string | null;
@@ -49,8 +82,8 @@ export default function ExamRunner(props: {
   settings: Settings;
 }) {
   const { attemptId, questions, settings: S } = props;
-  const [answers, setAnswers] = useState<Record<number, any>>(() => Object.fromEntries(questions.map((q) => [q.id, q.answer])));
-  const [files, setFiles] = useState<Record<number, string | null>>(() => Object.fromEntries(questions.map((q) => [q.id, q.fileName])));
+  const [answers, setAnswers] = useState<Record<string, any>>(() => Object.fromEntries(questions.map((q) => [q.id, q.answer])));
+  const [files, setFiles] = useState<Record<string, string | null>>(() => Object.fromEntries(questions.map((q) => [q.id, q.fileName])));
   const [idx, setIdx] = useState(0);
   const [maxIdx, setMaxIdx] = useState(0);
   const [started, setStarted] = useState(false);
@@ -68,7 +101,7 @@ export default function ExamRunner(props: {
   const picking = useRef<number>(0); // timestamp until which a file picker may legitimately hide the page
   const lastLeave = useRef(0);
   const lastLog = useRef<Record<string, number>>({});
-  const timers = useRef<Record<number, any>>({});
+  const timers = useRef<Record<string, any>>({});
   const offset = useRef(0);
   const fsSupported = useRef(false);
 
@@ -249,7 +282,7 @@ export default function ExamRunner(props: {
   }
 
   // ---------- Answers ----------
-  async function persist(qid: number, answer: any) {
+  async function persist(qid: string, answer: any) {
     setSaveState("saving");
     try {
       const r = await saveResponse(attemptId, qid, answer);
@@ -265,28 +298,37 @@ export default function ExamRunner(props: {
       setSaveError("Connection problem. Your answer will be saved when you change it again.");
     }
   }
-  function setAnswer(qid: number, answer: any, debounce = 0) {
+  function setAnswer(qid: string, answer: any, debounce = 0) {
     setAnswers((a) => ({ ...a, [qid]: answer }));
     clearTimeout(timers.current[qid]);
     if (debounce) timers.current[qid] = setTimeout(() => persist(qid, answer), debounce);
     else persist(qid, answer);
   }
 
+  /** Sends the file in small pieces (see lib/files.ts) so each request stays under hosting limits. */
   async function upload(q: Q, file: File | undefined) {
     picking.current = Date.now() + 1500;
     if (!file) return;
-    const fd = new FormData();
-    fd.set("attempt_id", String(attemptId));
-    fd.set("question_id", String(q.id));
-    fd.set("file", file);
     setSaveState("saving");
-    const r = await uploadResponseFile(fd).catch(() => ({ ok: false, error: "Upload failed. Check your connection." }) as any);
-    if (r.ok) {
-      setFiles((f) => ({ ...f, [q.id]: r.name }));
+    try {
+      file = await shrinkImage(file, q.accept || "");
+      const st = await startUpload(attemptId, q.id, file.name, file.size);
+      if (!st.ok) throw new Error(st.error);
+      const n = Math.ceil(file.size / st.chunkBytes!);
+      for (let i = 0; i < n; i++) {
+        const fd = new FormData();
+        fd.set("file_id", st.fileId!);
+        fd.set("index", String(i));
+        fd.set("chunk", file.slice(i * st.chunkBytes!, (i + 1) * st.chunkBytes!));
+        setSaveError("");
+        const r = await uploadChunk(fd);
+        if (!r.ok) throw new Error(r.error);
+        if (r.done) setFiles((f) => ({ ...f, [q.id]: r.name! }));
+      }
       setSaveState("saved");
-    } else {
+    } catch (e: any) {
       setSaveState("error");
-      setSaveError(r.error);
+      setSaveError(e?.message || "Upload failed. Check your connection.");
     }
   }
 
@@ -298,7 +340,7 @@ export default function ExamRunner(props: {
     setSubmitting(true);
     armed.current = false;
     // Flush any pending debounced saves first.
-    await Promise.all(Object.entries(timers.current).map(([qid, t]) => { clearTimeout(t); return persist(Number(qid), answers[Number(qid)]); }));
+    await Promise.all(Object.entries(timers.current).map(([qid, t]) => { clearTimeout(t); return persist(qid, answers[qid]); }));
     await finishAttempt(attemptId, "student");
     goReview();
   }

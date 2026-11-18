@@ -1,7 +1,6 @@
 import { notFound, redirect } from "next/navigation";
-import { get, all } from "@/lib/db";
 import { requireUser } from "@/lib/auth";
-import { getExam, getQuestion, pastDeadline, submitAttempt, DEADLINE_GRACE_MS, type LayoutEntry } from "@/lib/exam";
+import { getAttempt, getExam, getQuestions, pastDeadline, responsesFor, submitAttempt, DEADLINE_GRACE_MS, type LayoutEntry } from "@/lib/exam";
 import { hasLockdownPass } from "@/lib/seb-access";
 import ExamRunner from "@/components/ExamRunner";
 
@@ -10,21 +9,23 @@ export const dynamic = "force-dynamic";
 export default async function TakeAttempt({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const u = await requireUser();
-  const a = get("SELECT * FROM attempts WHERE id = ?", Number(id));
+  let a = await getAttempt(id);
   if (!a || a.user_id !== u.id) notFound();
-  const exam = getExam(a.exam_id)!;
-  if (a.status === "in_progress" && pastDeadline(a, DEADLINE_GRACE_MS)) submitAttempt(a.id, "time");
-  const fresh = get("SELECT status FROM attempts WHERE id = ?", a.id);
-  if (fresh.status !== "in_progress") redirect(`/attempts/${a.id}/review`);
+  const exam = (await getExam(a.exam_id))!;
+  if (a.status === "in_progress" && pastDeadline(a, DEADLINE_GRACE_MS)) {
+    await submitAttempt(a.id, "time");
+    a = (await getAttempt(id))!;
+  }
+  if (a.status !== "in_progress") redirect(`/attempts/${a.id}/review`);
   if (exam.require_lockdown && !(await hasLockdownPass(exam.id, u.id))) redirect(`/exams/${exam.id}?seb=required`);
 
   const layout: LayoutEntry[] = JSON.parse(a.layout_json);
-  const saved = all("SELECT question_id, answer_json, file_name FROM responses WHERE attempt_id = ?", a.id);
+  const [saved, qs] = await Promise.all([responsesFor(a.id), getQuestions(layout.map((l) => l.qid))]);
   // Only what the student needs: never send answer keys or explanations to the browser during an attempt.
-  const questions = layout.map((l) => {
-    const q = getQuestion(l.qid)!;
+  const questions = layout.filter((l) => qs.has(l.qid)).map((l) => {
+    const q = qs.get(l.qid)!;
     const byId = new Map(q.options.map((o) => [o.id, o]));
-    const r = saved.find((s: any) => s.question_id === l.qid);
+    const r = saved.find((s) => s.question_id === l.qid);
     return {
       id: q.id,
       type: q.type,
@@ -32,7 +33,7 @@ export default async function TakeAttempt({ params }: { params: Promise<{ id: st
       points: q.points,
       options: l.opts.map((oid) => byId.get(oid)).filter(Boolean),
       accept: q.type === "file" ? q.answer?.accept || "" : "",
-      maxMb: q.type === "file" ? q.answer?.maxMb || 20 : 0,
+      maxMb: q.type === "file" ? Math.min(10, q.answer?.maxMb || 2) : 0,
       answer: r?.answer_json ? JSON.parse(r.answer_json) : null,
       fileName: r?.file_name || null,
     };

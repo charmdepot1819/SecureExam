@@ -4,3 +4,8 @@ data/*.db*
 data/uploads
 next-env.d.ts
 *.tsbuildinfo
+
+.env
+.env.local
+.firebase
+*-debug.log

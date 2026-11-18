@@ -12,8 +12,8 @@ const q = (v: any) => {
 export async function GET(_: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
   const u = await currentUser();
-  if (!u || courseRole(Number(id), u.id) !== "teacher") return new NextResponse("Forbidden", { status: 403 });
-  const { exams, rows } = gradebook(Number(id));
+  if (!u || (await courseRole(id, u.id)) !== "teacher") return new NextResponse("Forbidden", { status: 403 });
+  const { exams, rows } = await gradebook(id);
   const header: any[] = ["Student", "Email", ...exams.flatMap((x) => [`${x.title} score`, `${x.title} max`]), "Total %"];
   const lines = rows.map((r) => [
     r.student.name,

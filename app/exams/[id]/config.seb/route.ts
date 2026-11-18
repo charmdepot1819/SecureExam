@@ -10,7 +10,7 @@ import { toPlistXml } from "@/lib/seb";
  */
 export async function GET(_: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  const exam = getExam(Number(id));
+  const exam = await getExam(id);
   if (!exam || !exam.published || !exam.require_lockdown) return new NextResponse("Not found", { status: 404 });
   const xml = toPlistXml(examSebConfig(exam, await baseUrl()));
   return new NextResponse(xml, {

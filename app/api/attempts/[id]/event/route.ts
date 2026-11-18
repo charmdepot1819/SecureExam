@@ -9,7 +9,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const { id } = await ctx.params;
   const body = await req.json().catch(() => ({}));
   try {
-    const r = await reportIntegrityEvent(Number(id), String(body.type || "other"), String(body.detail || ""));
+    const r = await reportIntegrityEvent(id, String(body.type || "other"), String(body.detail || ""));
     return NextResponse.json(r);
   } catch (e: any) {
     return NextResponse.json({ error: String(e?.message || e) }, { status: 403 });

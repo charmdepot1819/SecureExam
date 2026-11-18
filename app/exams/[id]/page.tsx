@@ -1,8 +1,8 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
-import { get } from "@/lib/db";
+import { getById } from "@/lib/db";
 import { requireUser, courseRole } from "@/lib/auth";
-import { attemptsFor, canStart, examQuestionCount, feedbackVisible, getExam, pct, sweepExpired } from "@/lib/exam";
+import { attemptsFor, canStart, examQuestionCount, feedbackVisible, getExam, pct, sweepForExam } from "@/lib/exam";
 import { beginAttempt } from "../../actions";
 import { baseUrl, hasLockdownPass } from "@/lib/seb-access";
 import When from "@/components/When";
@@ -10,16 +10,17 @@ import When from "@/components/When";
 export default async function ExamLanding({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ seb?: string; pledge?: string }> }) {
   const { id } = await params;
   const sp = await searchParams;
-  const exam = getExam(Number(id));
+  const exam = await getExam(id);
   if (!exam) notFound();
   const u = await requireUser();
-  const role = courseRole(exam.course_id, u.id);
+  const role = await courseRole(exam.course_id, u.id);
   if (!role) redirect("/dashboard");
-  sweepExpired();
-  const course = get("SELECT * FROM courses WHERE id = ?", exam.course_id);
-  const atts = attemptsFor(exam.id, u.id);
-  const inProgress = atts.find((a: any) => a.status === "in_progress");
-  const av = canStart(exam, u.id);
+  await sweepForExam(exam.id);
+  const course = (await getById("courses", exam.course_id))!;
+  const atts = await attemptsFor(exam.id, u.id);
+  const inProgress = atts.find((a) => a.status === "in_progress");
+  const av = await canStart(exam, u.id);
+  const qCount = await examQuestionCount(exam.id);
   const sebOk = !exam.require_lockdown || (await hasLockdownPass(exam.id, u.id));
   const base = await baseUrl();
   const sebLink = `${base.replace(/^http/, "seb")}/exams/${exam.id}/config.seb`;
@@ -46,7 +47,7 @@ export default async function ExamLanding({ params, searchParams }: { params: Pr
       <div className="card">
         <div className="grid two">
           <div><small>Due</small><div><When iso={exam.due_at} empty="No due date" /></div></div>
-          <div><small>Questions</small><div>{examQuestionCount(exam.id)}</div></div>
+          <div><small>Questions</small><div>{qCount}</div></div>
           <div><small>Time limit</small><div>{exam.time_limit_min ? `${exam.time_limit_min} minutes` : "None"}</div></div>
           <div><small>Attempts</small><div>{atts.length} of {exam.max_attempts || "unlimited"}</div></div>
         </div>

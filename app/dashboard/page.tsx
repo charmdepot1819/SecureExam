@@ -1,21 +1,29 @@
 import Link from "next/link";
 import { requireUser, educatorMode } from "@/lib/auth";
-import { all } from "@/lib/db";
+import { fdb, getById, where } from "@/lib/db";
+import { storedBytes } from "@/lib/files";
+import StorageMeter from "@/components/StorageMeter";
 import When from "@/components/When";
-import { attemptsFor, canStart, getExam, isAssigned, sweepExpired } from "@/lib/exam";
+import { attemptsFor, canStart, isAssigned, sweepForUser, type Exam } from "@/lib/exam";
 
 export default async function Dashboard() {
   const user = await requireUser();
-  sweepExpired();
+  await sweepForUser(user.id);
   const edu = await educatorMode(user);
+  const enr = await where("enrollments", ["user_id", "==", user.id]);
 
   if (edu) {
-    const courses = all(
-      `SELECT c.*, (SELECT COUNT(*) FROM enrollments e WHERE e.course_id = c.id AND e.role = 'student') AS students,
-        (SELECT COUNT(*) FROM attempts a JOIN exams x ON x.id = a.exam_id WHERE x.course_id = c.id AND a.status = 'submitted') AS to_grade
-       FROM courses c JOIN enrollments en ON en.course_id = c.id AND en.user_id = ? AND en.role = 'teacher' ORDER BY c.id DESC`,
-      user.id
-    );
+    const courseIds = enr.filter((e: any) => e.role === "teacher").map((e: any) => e.course_id);
+    const courses = (await Promise.all(courseIds.map(async (id: string) => {
+      const c = await getById("courses", id);
+      if (!c) return null;
+      // Count aggregations cost one read per 1,000 matches, not one per document.
+      const [students, toGrade] = await Promise.all([
+        fdb().collection("enrollments").where("course_id", "==", id).where("role", "==", "student").count().get(),
+        fdb().collection("attempts").where("course_id", "==", id).where("status", "==", "submitted").count().get(),
+      ]).then((r) => r.map((x) => x.data().count));
+      return { ...c, students, to_grade: toGrade };
+    }))).filter(Boolean).sort((a: any, b: any) => (b.created_at || "").localeCompare(a.created_at || ""));
     return (
       <main className="wrap">
         <div className="spread">
@@ -32,26 +40,19 @@ export default async function Dashboard() {
             </Link>
           ))}
         </div>
+        {courses.length > 0 && <div className="card"><StorageMeter bytes={await storedBytes()} /></div>}
       </main>
     );
   }
 
-  const courses = all(
-    `SELECT c.* FROM courses c JOIN enrollments e ON e.course_id = c.id AND e.user_id = ? AND e.role = 'student' ORDER BY c.title`,
-    user.id
-  );
-  const exams = all(
-    `SELECT x.id FROM exams x JOIN enrollments e ON e.course_id = x.course_id AND e.user_id = ? AND e.role = 'student'
-     WHERE x.published = 1 ORDER BY COALESCE(x.due_at, '9999') ASC`,
-    user.id
-  )
-    .map((r: any) => getExam(r.id)!)
-    .filter((x) => isAssigned(x, user.id));
-  const todo = exams.map((x) => {
-    const atts = attemptsFor(x.id, user.id);
-    const av = canStart(x, user.id);
-    return { x, atts, av, course: courses.find((c: any) => c.id === x.course_id) };
-  });
+  const courseIds = enr.filter((e: any) => e.role === "student").map((e: any) => e.course_id);
+  const courses = (await Promise.all(courseIds.map((id: string) => getById("courses", id)))).filter(Boolean).sort((a: any, b: any) => a.title.localeCompare(b.title));
+  const exams: Exam[] = [];
+  for (const c of courses) {
+    for (const x of await where<Exam>("exams", ["course_id", "==", c.id], ["published", "==", 1])) if (await isAssigned(x, user.id)) exams.push(x);
+  }
+  exams.sort((a, b) => (a.due_at || "9999").localeCompare(b.due_at || "9999"));
+  const todo = await Promise.all(exams.map(async (x) => ({ x, atts: await attemptsFor(x.id, user.id), av: await canStart(x, user.id), course: courses.find((c: any) => c.id === x.course_id) })));
 
   return (
     <main className="wrap">
@@ -64,8 +65,8 @@ export default async function Dashboard() {
         {todo.length === 0 && <p className="muted">Nothing assigned right now.</p>}
         <ul className="list">
           {todo.map(({ x, atts, av, course }) => {
-            const done = atts.some((a: any) => a.status !== "in_progress");
-            const inProg = atts.some((a: any) => a.status === "in_progress");
+            const done = atts.some((a) => a.status !== "in_progress");
+            const inProg = atts.some((a) => a.status === "in_progress");
             return (
               <li key={x.id}>
                 <div className="spread">

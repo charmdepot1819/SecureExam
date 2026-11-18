@@ -1,192 +1,133 @@
-import { DatabaseSync } from "node:sqlite";
-import fs from "node:fs";
-import path from "node:path";
+/**
+ * Firebase Admin access (server only). All reads and writes go through the server with the Admin SDK;
+ * the Firestore security rules deny direct access from browsers (see firestore.rules).
+ *
+ * Collections (documents keep the same snake_case fields the app used with SQL):
+ *   users/{uid}                     name, email, is_educator, created_at
+ *   courses/{id}                    title, code, description, owner_id, created_at
+ *   enrollments/{courseId_userId}   course_id, user_id, role ('teacher' | 'student')
+ *   banks/{id}                      course_id, title
+ *   questions/{id}                  course_id, bank_id, type, prompt, options, answer, points, feedback, created_at
+ *   exams/{id}                      course_id, title, settings…, published, assign_all
+ *   exam_items/{id}                 exam_id, position, question_id | bank_id + draw_count
+ *   exam_assignees/{examId_userId}  exam_id, user_id
+ *   attempts/{id}                   exam_id, user_id, started_at, deadline_at, status, score, layout_json, …
+ *   responses/{attemptId_qid}       attempt_id, question_id, answer_json, file_path, file_name, points_awarded, …
+ *   attempt_events/{id}             attempt_id, type, detail, at
+ *   files/{id}                      upload metadata; files/{id}/chunks/{n} hold the bytes (≤ 900 KB each)
+ *   lockdown_passes/{examId_userId} Safe Exam Browser verification bound to a login session
+ */
+import { initializeApp, getApps, cert, type App } from "firebase-admin/app";
+import { getFirestore, FieldValue, type Firestore, type WhereFilterOp } from "firebase-admin/firestore";
+import { getAuth } from "firebase-admin/auth";
 
-export const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
-export const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
-
-const SCHEMA = `
-
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  password_hash TEXT NOT NULL,
-  is_educator INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-  token TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  expires_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS courses (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  title TEXT NOT NULL,
-  code TEXT NOT NULL DEFAULT '',
-  description TEXT NOT NULL DEFAULT '',
-  owner_id INTEGER NOT NULL REFERENCES users(id),
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS enrollments (
-  course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  role TEXT NOT NULL CHECK (role IN ('teacher','student')),
-  PRIMARY KEY (course_id, user_id)
-);
-
-CREATE TABLE IF NOT EXISTS banks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-  title TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS questions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-  bank_id INTEGER REFERENCES banks(id) ON DELETE SET NULL,
-  type TEXT NOT NULL CHECK (type IN ('mc','multi','tf','short','essay','file')),
-  prompt TEXT NOT NULL,
-  options_json TEXT NOT NULL DEFAULT '[]',
-  answer_json TEXT NOT NULL DEFAULT '{}',
-  points REAL NOT NULL DEFAULT 1,
-  feedback TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS exams (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  instructions TEXT NOT NULL DEFAULT '',
-  kind TEXT NOT NULL DEFAULT 'quiz' CHECK (kind IN ('quiz','exam','assignment')),
-  time_limit_min INTEGER,
-  available_from TEXT,
-  due_at TEXT,
-  lock_at TEXT,
-  allow_late INTEGER NOT NULL DEFAULT 0,
-  max_attempts INTEGER NOT NULL DEFAULT 1,
-  shuffle_questions INTEGER NOT NULL DEFAULT 1,
-  shuffle_options INTEGER NOT NULL DEFAULT 1,
-  feedback_mode TEXT NOT NULL DEFAULT 'after_due' CHECK (feedback_mode IN ('immediate','after_due','never')),
-  show_correct INTEGER NOT NULL DEFAULT 1,
-  focus_policy TEXT NOT NULL DEFAULT 'submit' CHECK (focus_policy IN ('off','log','submit')),
-  focus_warnings INTEGER NOT NULL DEFAULT 0,
-  require_fullscreen INTEGER NOT NULL DEFAULT 1,
-  block_copy INTEGER NOT NULL DEFAULT 1,
-  one_at_a_time INTEGER NOT NULL DEFAULT 0,
-  lock_backtrack INTEGER NOT NULL DEFAULT 0,
-  require_pledge INTEGER NOT NULL DEFAULT 1,
-  require_lockdown INTEGER NOT NULL DEFAULT 0,
-  seb_quit_hash TEXT NOT NULL DEFAULT '',
-  seb_extra_keys TEXT NOT NULL DEFAULT '',
-  published INTEGER NOT NULL DEFAULT 0,
-  assign_all INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS exam_items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  exam_id INTEGER NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
-  position INTEGER NOT NULL,
-  question_id INTEGER REFERENCES questions(id) ON DELETE CASCADE,
-  bank_id INTEGER REFERENCES banks(id) ON DELETE CASCADE,
-  draw_count INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS exam_assignees (
-  exam_id INTEGER NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  PRIMARY KEY (exam_id, user_id)
-);
-
-CREATE TABLE IF NOT EXISTS attempts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  exam_id INTEGER NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  started_at TEXT NOT NULL,
-  deadline_at TEXT,
-  submitted_at TEXT,
-  submit_reason TEXT,
-  status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress','submitted','graded')),
-  score REAL,
-  max_score REAL,
-  late INTEGER NOT NULL DEFAULT 0,
-  layout_json TEXT NOT NULL,
-  client TEXT NOT NULL DEFAULT 'browser',
-  focus_losses INTEGER NOT NULL DEFAULT 0,
-  overall_feedback TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS responses (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  attempt_id INTEGER NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
-  question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
-  answer_json TEXT,
-  file_path TEXT,
-  file_name TEXT,
-  auto_correct INTEGER,
-  points_awarded REAL,
-  needs_grading INTEGER NOT NULL DEFAULT 0,
-  feedback TEXT NOT NULL DEFAULT '',
-  UNIQUE (attempt_id, question_id)
-);
-
-CREATE TABLE IF NOT EXISTS attempt_events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  attempt_id INTEGER NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
-  type TEXT NOT NULL,
-  detail TEXT NOT NULL DEFAULT '',
-  at TEXT NOT NULL
-);
-`;
+/**
+ * Admin credentials come from FIREBASE_SERVICE_ACCOUNT: the service-account JSON downloaded from
+ * Firebase console → Project settings → Service accounts (paste the JSON, or base64 of it).
+ * Without it (local emulators), only the project id is needed.
+ */
+function config() {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT?.trim();
+  if (raw) {
+    const json = JSON.parse(raw.startsWith("{") ? raw : Buffer.from(raw, "base64").toString("utf8"));
+    return { credential: cert(json), projectId: json.project_id };
+  }
+  return { projectId: process.env.GCLOUD_PROJECT || process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID };
+}
 
 declare global {
   // eslint-disable-next-line no-var
-  var __examDb: DatabaseSync | undefined;
+  var __fbApp: App | undefined;
+  // eslint-disable-next-line no-var
+  var __fs: Firestore | undefined;
 }
 
-function open(): DatabaseSync {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  const conn = new DatabaseSync(path.join(DATA_DIR, "exam-online.db"));
-  conn.exec("PRAGMA busy_timeout = 10000;");
-  conn.exec("PRAGMA journal_mode = WAL;");
-  conn.exec("PRAGMA foreign_keys = ON;");
-  conn.exec(SCHEMA);
-  return conn;
+export function app(): App {
+  if (globalThis.__fbApp) return globalThis.__fbApp;
+  globalThis.__fbApp = getApps()[0] ?? initializeApp(config());
+  return globalThis.__fbApp;
 }
 
-/** Opened lazily on first use (not at import time), so builds and parallel workers don't contend for the file. */
-function getDb(): DatabaseSync {
-  return globalThis.__examDb ?? (globalThis.__examDb = open());
+export function fdb(): Firestore {
+  if (!globalThis.__fs) {
+    globalThis.__fs = getFirestore(app());
+    globalThis.__fs.settings({ ignoreUndefinedProperties: true });
+  }
+  return globalThis.__fs;
 }
 
-type Params = (string | number | null)[];
+export const adminAuth = () => getAuth(app());
+export { FieldValue };
 
-export function all<T = any>(sql: string, ...params: Params): T[] {
-  // node:sqlite returns null-prototype rows; copy them so they can be passed to client components.
-  return getDb().prepare(sql).all(...params).map((r) => ({ ...r })) as T[];
+export type Cond = [string, WhereFilterOp, any];
+
+function withId<T>(d: FirebaseFirestore.DocumentSnapshot): T {
+  return { id: d.id, ...(d.data() as any) } as T;
 }
-export function get<T = any>(sql: string, ...params: Params): T | undefined {
-  const r = getDb().prepare(sql).get(...params);
-  return (r ? { ...r } : undefined) as T | undefined;
+
+export async function getById<T = any>(collection: string, id: string | null | undefined): Promise<T | undefined> {
+  if (!id) return undefined;
+  const d = await fdb().collection(collection).doc(String(id)).get();
+  return d.exists ? withId<T>(d) : undefined;
 }
-export function run(sql: string, ...params: Params) {
-  const r = getDb().prepare(sql).run(...params);
-  return { id: Number(r.lastInsertRowid), changes: Number(r.changes) };
+
+/** Equality/array-contains queries only, so no composite indexes are needed. Sort in code. */
+export async function where<T = any>(collection: string, ...conds: Cond[]): Promise<T[]> {
+  let q: FirebaseFirestore.Query = fdb().collection(collection);
+  for (const [f, op, v] of conds) q = q.where(f, op, v);
+  const snap = await q.get();
+  return snap.docs.map((d) => withId<T>(d));
 }
-export function tx<T>(fn: () => T): T {
-  getDb().exec("BEGIN");
-  try {
-    const out = fn();
-    getDb().exec("COMMIT");
-    return out;
-  } catch (e) {
-    getDb().exec("ROLLBACK");
-    throw e;
+
+export async function first<T = any>(collection: string, ...conds: Cond[]): Promise<T | undefined> {
+  let q: FirebaseFirestore.Query = fdb().collection(collection);
+  for (const [f, op, v] of conds) q = q.where(f, op, v);
+  const snap = await q.limit(1).get();
+  return snap.empty ? undefined : withId<T>(snap.docs[0]);
+}
+
+/** Fetches documents by id in batches (one read each), instead of scanning the whole collection. */
+export async function getMany<T = any>(collection: string, ids: (string | null | undefined)[]): Promise<Map<string, T>> {
+  const uniq = [...new Set(ids.filter(Boolean).map(String))];
+  const out = new Map<string, T>();
+  for (let i = 0; i < uniq.length; i += 300) {
+    const refs = uniq.slice(i, i + 300).map((id) => fdb().collection(collection).doc(id));
+    const snaps = await fdb().getAll(...refs);
+    for (const d of snaps) if (d.exists) out.set(d.id, withId<T>(d));
+  }
+  return out;
+}
+
+export async function allDocs<T = any>(collection: string, limit = 1000): Promise<T[]> {
+  const snap = await fdb().collection(collection).limit(limit).get();
+  return snap.docs.map((d) => withId<T>(d));
+}
+
+export async function insert(collection: string, data: Record<string, any>, id?: string): Promise<string> {
+  const ref = id ? fdb().collection(collection).doc(id) : fdb().collection(collection).doc();
+  await ref.set(data);
+  return ref.id;
+}
+
+export async function upsert(collection: string, id: string, data: Record<string, any>) {
+  await fdb().collection(collection).doc(id).set(data, { merge: true });
+}
+
+export async function update(collection: string, id: string, data: Record<string, any>) {
+  await fdb().collection(collection).doc(id).update(data);
+}
+
+export async function remove(collection: string, id: string) {
+  await fdb().collection(collection).doc(id).delete();
+}
+
+/** Deletes every document matching the conditions (batched). */
+export async function removeWhere(collection: string, ...conds: Cond[]) {
+  const rows = await where(collection, ...conds);
+  for (let i = 0; i < rows.length; i += 400) {
+    const b = fdb().batch();
+    for (const r of rows.slice(i, i + 400)) b.delete(fdb().collection(collection).doc(r.id));
+    await b.commit();
   }
 }
 

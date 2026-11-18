@@ -101,7 +101,7 @@ ${plistNode(config, "")}
 
 export type SebOptions = {
   baseUrl: string; // e.g. https://exams.example.edu
-  examId: number;
+  examId: string;
   /** SHA-256 hex of the quit password (only the hash is stored and sent). */
   quitPasswordHash?: string;
   allowedHosts: string[];

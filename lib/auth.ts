@@ -1,65 +1,76 @@
-import crypto from "node:crypto";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { get, run } from "./db";
+import { adminAuth, getById, fdb, nowIso, update } from "./db";
 
 export type User = {
-  id: number;
+  id: string;
   name: string;
   email: string;
   is_educator: number;
+  view_mode?: "educator" | "student";
 };
 
-const SESSION_COOKIE = "eo_session";
-const MODE_COOKIE = "eo_mode";
-const SESSION_DAYS = 14;
+/** Firebase Hosting forwards only a cookie named "__session" to backends, so the app keeps all state in that one cookie. */
+export const SESSION_COOKIE = "__session";
+export const SESSION_DAYS = 14;
 
-export function hashPassword(password: string): string {
-  const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(password, salt, 64);
-  return `scrypt$${salt.toString("hex")}$${hash.toString("hex")}`;
-}
-
-export function verifyPassword(password: string, stored: string): boolean {
-  const [scheme, saltHex, hashHex] = stored.split("$");
-  if (scheme !== "scrypt") return false;
-  const expected = Buffer.from(hashHex, "hex");
-  const actual = crypto.scryptSync(password, Buffer.from(saltHex, "hex"), expected.length);
-  return crypto.timingSafeEqual(expected, actual);
-}
-
-export async function createSession(userId: number) {
-  const token = crypto.randomBytes(32).toString("hex");
-  const expires = new Date(Date.now() + SESSION_DAYS * 864e5);
-  run("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)", token, userId, expires.toISOString());
+/**
+ * Exchanges a fresh Firebase ID token (from the browser sign-in) for an HTTP-only session cookie,
+ * and creates the user's profile on first sign-in. The very first profile becomes an educator.
+ */
+export async function createSessionFromIdToken(idToken: string, name?: string) {
+  const decoded = await adminAuth().verifyIdToken(idToken, true);
+  if (Date.now() / 1000 - decoded.auth_time > 5 * 60) throw new Error("Please sign in again.");
+  const ref = fdb().collection("users").doc(decoded.uid);
+  await fdb().runTransaction(async (t) => {
+    const me = await t.get(ref);
+    if (me.exists) return;
+    const meta = fdb().collection("meta").doc("app");
+    const m = await t.get(meta);
+    const first = !m.exists || !m.data()?.has_users;
+    t.set(meta, { has_users: true }, { merge: true });
+    t.set(ref, {
+      name: (name || decoded.name || decoded.email?.split("@")[0] || "User").slice(0, 120),
+      email: (decoded.email || "").toLowerCase(),
+      is_educator: first ? 1 : 0,
+      created_at: nowIso(),
+    });
+  });
+  const expiresIn = SESSION_DAYS * 864e5;
+  const cookie = await adminAuth().createSessionCookie(idToken, { expiresIn });
   const jar = await cookies();
-  jar.set(SESSION_COOKIE, token, {
+  jar.set(SESSION_COOKIE, cookie, {
     httpOnly: true,
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production" && process.env.INSECURE_COOKIES !== "1",
-    expires,
+    maxAge: expiresIn / 1000,
     path: "/",
   });
 }
 
 export async function destroySession() {
   const jar = await cookies();
-  const token = jar.get(SESSION_COOKIE)?.value;
-  if (token) run("DELETE FROM sessions WHERE token = ?", token);
+  const c = jar.get(SESSION_COOKIE)?.value;
+  if (c) {
+    try {
+      const d = await adminAuth().verifySessionCookie(c);
+      await adminAuth().revokeRefreshTokens(d.sub);
+    } catch {}
+  }
   jar.delete(SESSION_COOKIE);
 }
 
 export async function currentUser(): Promise<User | null> {
   const jar = await cookies();
-  const token = jar.get(SESSION_COOKIE)?.value;
-  if (!token) return null;
-  const row = get<User & { expires_at: string }>(
-    `SELECT u.id, u.name, u.email, u.is_educator, s.expires_at
-     FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`,
-    token
-  );
-  if (!row || new Date(row.expires_at) < new Date()) return null;
-  return { id: row.id, name: row.name, email: row.email, is_educator: row.is_educator };
+  const c = jar.get(SESSION_COOKIE)?.value;
+  if (!c) return null;
+  try {
+    const d = await adminAuth().verifySessionCookie(c, true); // also rejects revoked sessions
+    const u = await getById<User>("users", d.uid);
+    return u ? { id: u.id, name: u.name, email: u.email, is_educator: u.is_educator, view_mode: u.view_mode } : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function requireUser(): Promise<User> {
@@ -71,13 +82,12 @@ export async function requireUser(): Promise<User> {
 /** Educator mode is on when the user is an educator and has not switched to student view. */
 export async function educatorMode(user: User | null): Promise<boolean> {
   if (!user?.is_educator) return false;
-  const jar = await cookies();
-  return jar.get(MODE_COOKIE)?.value !== "student";
+  return user.view_mode !== "student";
 }
 
-export async function setMode(mode: "educator" | "student") {
-  const jar = await cookies();
-  jar.set(MODE_COOKIE, mode, { path: "/", sameSite: "lax" });
+/** Stored on the profile rather than in a second cookie (see SESSION_COOKIE). */
+export async function setMode(userId: string, mode: "educator" | "student") {
+  await update("users", userId, { view_mode: mode });
 }
 
 export async function requireEducator(): Promise<User> {
@@ -86,17 +96,13 @@ export async function requireEducator(): Promise<User> {
   return u;
 }
 
-export function courseRole(courseId: number, userId: number): "teacher" | "student" | null {
-  const r = get<{ role: "teacher" | "student" }>(
-    "SELECT role FROM enrollments WHERE course_id = ? AND user_id = ?",
-    courseId,
-    userId
-  );
+export async function courseRole(courseId: string, userId: string): Promise<"teacher" | "student" | null> {
+  const r = await getById<{ role: "teacher" | "student" }>("enrollments", `${courseId}_${userId}`);
   return r?.role ?? null;
 }
 
-export async function requireTeacher(courseId: number): Promise<User> {
+export async function requireTeacher(courseId: string): Promise<User> {
   const u = await requireUser();
-  if (courseRole(courseId, u.id) !== "teacher") redirect("/dashboard");
+  if ((await courseRole(courseId, u.id)) !== "teacher") redirect("/dashboard");
   return u;
 }

@@ -1,18 +1,9 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import { cookies, headers } from "next/headers";
-import { DATA_DIR } from "./db";
+import { getById, upsert } from "./db";
+import { SESSION_COOKIE } from "./auth";
 import type { Exam } from "./exam";
 import { buildSebConfig, configKey, urlKeyHash, SEB_HEADERS } from "./seb";
-
-/** Server secret used to sign SEB pass cookies. Taken from APP_SECRET or generated once into the data folder. */
-function secret(): string {
-  if (process.env.APP_SECRET) return process.env.APP_SECRET;
-  const f = path.join(DATA_DIR, ".secret");
-  if (!fs.existsSync(f)) fs.writeFileSync(f, crypto.randomBytes(32).toString("hex"), { mode: 0o600 });
-  return fs.readFileSync(f, "utf8").trim();
-}
 
 /** Public base URL (scheme + host) of this app as the student's browser sees it. */
 export async function baseUrl(): Promise<string> {
@@ -60,35 +51,39 @@ export async function verifySebHeaders(exam: Exam, pathWithQuery: string): Promi
 export type LockdownClient = "seb";
 
 const PASS_HOURS = 6;
-const passCookie = (examId: number) => `eo_ld_${examId}`;
+const sessionHash = (c: string) => crypto.createHash("sha256").update(c).digest("hex");
 
-function sign(payload: string) {
-  return crypto.createHmac("sha256", secret()).update(payload).digest("hex");
-}
-
-/** Issues a signed, short-lived cookie proving this user's session was verified inside a lockdown client for this exam. */
-export async function grantLockdownPass(examId: number, userId: number, client: LockdownClient) {
-  const exp = Date.now() + PASS_HOURS * 3600e3;
-  const payload = `${userId}.${examId}.${exp}.${client}`;
+/**
+ * Records that this user's current login session was verified inside SEB for this exam.
+ * Stored in Firestore (not a separate cookie) and bound to the session cookie, so a pass earned in SEB
+ * can't be reused from another browser.
+ */
+export async function grantLockdownPass(examId: string, userId: string, client: LockdownClient) {
   const jar = await cookies();
-  jar.set(passCookie(examId), `${payload}.${sign(payload)}`, { httpOnly: true, sameSite: "lax", path: "/", expires: new Date(exp) });
+  const c = jar.get(SESSION_COOKIE)?.value;
+  if (!c) return;
+  await upsert("lockdown_passes", `${examId}_${userId}`, {
+    exam_id: examId,
+    user_id: userId,
+    client,
+    session_hash: sessionHash(c),
+    expires_at: new Date(Date.now() + PASS_HOURS * 3600e3).toISOString(),
+  });
 }
 
-async function readPass(examId: number, userId: number): Promise<LockdownClient | null> {
+async function readPass(examId: string, userId: string): Promise<LockdownClient | null> {
   const jar = await cookies();
-  const v = jar.get(passCookie(examId))?.value;
-  if (!v) return null;
-  const [u, e, exp, client, sig] = v.split(".");
-  const expected = sign(`${u}.${e}.${exp}.${client}`);
-  if (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
-  if (Number(u) !== userId || Number(e) !== examId || Number(exp) < Date.now()) return null;
-  return client === "seb" ? client : null;
+  const c = jar.get(SESSION_COOKIE)?.value;
+  if (!c) return null;
+  const p = await getById("lockdown_passes", `${examId}_${userId}`);
+  if (!p || p.session_hash !== sessionHash(c) || new Date(p.expires_at) < new Date()) return null;
+  return p.client === "seb" ? "seb" : null;
 }
 
-export async function hasLockdownPass(examId: number, userId: number): Promise<boolean> {
+export async function hasLockdownPass(examId: string, userId: string): Promise<boolean> {
   return !!(await readPass(examId, userId));
 }
 
-export async function lockdownClient(examId: number, userId: number): Promise<string> {
+export async function lockdownClient(examId: string, userId: string): Promise<string> {
   return (await readPass(examId, userId)) || "browser";
 }

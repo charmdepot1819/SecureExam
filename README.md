@@ -10,45 +10,135 @@ A browser-based LMS for creating, delivering and grading quizzes, exams and file
 - **Gradebook** with CSV export, and **item analysis** (difficulty, discrimination, distractor use).
 - **Exam integrity.** Auto-submit when a student leaves the page (another tab or app, or exiting fullscreen), with optional warnings. Also fullscreen, copy/paste/right-click/print blocking, a student-name watermark, an academic honesty statement, two-tab detection, and an integrity log with timestamps for every attempt. Optional **Safe Exam Browser** enforcement for computer labs and iPads.
 
-## Run it locally
+## What it runs on (free, no credit card)
 
-Requirements: **Node.js 22.13 or newer**. The database is Node's built-in SQLite, so there's nothing else to install.
+| Piece | Service | Free plan |
+| --- | --- | --- |
+| Sign-in (email + password, password reset emails) | Firebase Authentication | Spark plan |
+| Database **and uploaded files** | Cloud Firestore | Spark plan: 1 GiB stored, 50,000 reads, 20,000 writes and 20,000 deletes per day, 10 GiB outbound per month |
+| The website and server code | Vercel | Hobby plan |
+
+Neither the Spark plan nor Vercel Hobby asks for a payment method. Cloud Storage for Firebase and Firebase App Hosting both need the paid Blaze plan, so this app stores uploads **inside Firestore**, split into pieces of up to 900 KB (a Firestore document can hold 1 MiB, and a Vercel request can carry 4.5 MB).
+
+All database access goes through the server with the Firebase Admin SDK. The Firestore security rules (`firestore.rules`) deny every direct request from browsers.
+
+### Will it fit a class of about 100 students?
+
+Yes, with the defaults:
+
+- **Uploads are capped at 2 MB per file** by default. A teacher can raise a question's cap to 10 MB. Photos larger than 500 KB are shrunk **on the student's phone** before upload (longest side 1,600 px, JPEG quality 0.8). In testing, a 6.4 MB photo became 877 KB.
+- **Storage:** 100 students × 2 MB is at most 200 MB per file assignment, so roughly five full file assignments fit in the free 1 GiB. Quizzes and grades are tiny next to files. A **storage meter** on the dashboard and course page shows how much is used.
+- **Clean-up keeps grades.** On an assessment's **Submissions** page, **Delete files from graded submissions** frees space but keeps every score and comment. Students then see "file deleted after grading". At the end of term, the course page has **Delete all course files**. Download anything you must keep first.
+- **Daily reads and writes:** a 30-question quiz taken by 100 students uses roughly 15,000 of the 50,000 daily reads and 3,500 of the 20,000 daily writes (answers autosave). Teacher pages use count queries, which Firestore bills as one read per 1,000 matches. If a daily quota runs out, Firestore refuses further requests until the quota resets at midnight Pacific time. Avoid scheduling several large exams on the same day.
+
+These numbers come from Firebase's published Spark limits and are estimates. Check **Firebase console → Usage and billing** during your first real exam.
+
+## Set it up step by step
+
+You need a Google account, a GitHub account and about 30 minutes. Paths below are the current console menus.
+
+### 1. Create the Firebase project
+
+1. Go to <https://console.firebase.google.com> and click **Create a project**. Name it (for example `exam-online-myschool`). Google Analytics is not needed.
+2. The project starts on the free **Spark** plan. Don't upgrade it.
+
+### 2. Turn on email sign-in
+
+1. **Build → Authentication → Get started**.
+2. **Sign-in method → Email/Password → Enable → Save**.
+
+### 3. Create the database
+
+1. **Build → Firestore Database → Create database**.
+2. Choose a location close to your students. For the Philippines, **asia-southeast1 (Singapore)** is the closest. The location can't be changed later.
+3. Start in **production mode**. The app's own rules replace these in step 6.
+
+### 4. Register the web app (public settings)
+
+1. **Project settings** (gear icon) → **General → Your apps → Web (`</>`)**. Give it a nickname. Firebase Hosting is not needed.
+2. Copy `apiKey`, `authDomain`, `projectId` and `appId` from the config shown. These are public values. They identify the project but don't grant access.
+
+### 5. Create the server key (secret)
+
+1. **Project settings → Service accounts → Generate new private key**. A `.json` file downloads.
+2. Treat it like a password. **Never commit it to GitHub** or share it. It goes only into Vercel's environment variables (step 7).
+3. To avoid quoting problems, convert it to one line of base64:
+   - macOS / Linux: `base64 -i key.json | tr -d '\n'`
+   - Windows PowerShell: `[Convert]::ToBase64String([IO.File]::ReadAllBytes("key.json"))`
+
+### 6. Upload the security rules and index settings
+
+On your computer (Node.js 22.13 or newer):
 
 ```bash
 npm install
-npm run seed      # optional: demo course, quiz and assignment
-npm run build
-npm start         # http://localhost:3000
+npx firebase-tools@14.27.0 login
+npx firebase-tools@14.27.0 use --add      # pick your project
+npm run deploy:rules                      # deploys firestore.rules and firestore.indexes.json
 ```
 
-For development, run `npm run dev` instead of build + start.
+`firestore.indexes.json` turns off indexing for large fields that are never searched (file pieces, answers, prompts). Google's Firestore best practices recommend this to save storage and write time.
 
-Demo logins (after `npm run seed`, password `password123` for all):
+### 7. Put the app on Vercel
+
+1. Push this folder to a **private** GitHub repository. `.gitignore` already excludes `.env` files.
+2. Go to <https://vercel.com>, sign up with GitHub (Hobby plan), then **Add New → Project** and import the repository. Vercel detects Next.js.
+3. Before deploying, open **Environment Variables** and add:
+
+| Name | Value |
+| --- | --- |
+| `NEXT_PUBLIC_FIREBASE_API_KEY` | `apiKey` from step 4 |
+| `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN` | `authDomain` from step 4 |
+| `NEXT_PUBLIC_FIREBASE_PROJECT_ID` | `projectId` from step 4 |
+| `NEXT_PUBLIC_FIREBASE_APP_ID` | `appId` from step 4 |
+| `FIREBASE_SERVICE_ACCOUNT` | the base64 text from step 5 |
+| `PUBLIC_URL` | optional: your final address, e.g. `https://exam-online-myschool.vercel.app` (needed for Safe Exam Browser if you use a custom domain) |
+
+4. Click **Deploy**. `vercel.json` runs the server in Singapore (`sin1`), next to the database. The Hobby plan allows one region. If you chose a different Firestore location, change `sin1` to the nearest [Vercel region](https://vercel.com/docs/regions).
+
+### 8. Allow sign-in from your Vercel address
+
+Firebase → **Authentication → Settings → Authorized domains → Add domain**, and enter your Vercel domain (e.g. `exam-online-myschool.vercel.app`). Without this, sign-in from the site is refused.
+
+### 9. Create your educator account
+
+Open your site and **register**. **The first account becomes an educator.** Later accounts are students until an educator promotes them under **Users**. Then share the link with students so they can register, and tag them on your course's **People** page.
+
+(Optional: `FIREBASE_SERVICE_ACCOUNT='<base64>' npm run seed` loads a demo course with demo accounts. Don't run it on a real class's project.)
+
+### Important limits of the free hosting
+
+- Vercel's terms allow the Hobby plan only for **personal or non-commercial use**. A teacher running a free class site fits that. A school charging fees, or a company, should use Vercel Pro or another host. This is your judgment call; read <https://vercel.com/legal/terms>.
+- No automatic backups on the free plan. Export the gradebook CSV after each assessment.
+- Firebase and Vercel change their free plans from time to time. Re-check the pricing pages before each school year.
+
+## Run it on your computer (for trying or development)
+
+This uses the Firebase **emulators**, local copies of Auth and Firestore. No Firebase project is needed. The emulators need Java 21 or newer.
+
+```bash
+npm install
+npm run emulators            # terminal 1: Auth on :9099, Firestore on :8080
+npm run seed:emulator        # terminal 2: demo course, quiz and assignment
+npm run dev:emulator         # http://localhost:3000
+```
+
+Demo logins (password `password123` for all):
 
 | Role | Email |
 | --- | --- |
 | Educator | teacher@example.com |
 | Students | student1@example.com, student2@example.com, student3@example.com |
 
-On a fresh install without seeding, **the first account you register becomes an educator**. Later accounts are students until an educator promotes them under **Users**.
+Emulator data disappears when you stop the emulators.
 
 ### Typical flow
 
-1. Educator: **New course**, then **People**: tag registered users as students (tick them or paste emails).
+1. Educator: **New course**, then **People**: search for registered users and tag them as students, or paste their emails.
 2. **Question bank**: add questions with explanations. Or write questions directly inside an assessment.
 3. Course page: **Create** a quiz, exam or assignment. Add questions or a random draw, set dates, time limit and integrity options, choose who it's assigned to, then **Publish**.
-4. Students see it under **My work**, read the rules, agree to the honesty statement and start.
-5. Educator: **Submissions**, then **Grade next**, then **Gradebook** and **Item analysis**.
-
-### Using it from students' phones
-
-Students need to reach the server. For a class trial on the same Wi-Fi, run `npm start` and have students open `http://<your-computer's-IP>:3000`. For real use, deploy behind HTTPS (any Node host or a VPS with a reverse proxy) and set:
-
-| Variable | Purpose |
-| --- | --- |
-| `PUBLIC_URL` | e.g. `https://exams.myschool.edu`. Used for Safe Exam Browser links and key checks. Set it whenever you're behind a proxy. |
-| `APP_SECRET` | Secret used to sign Safe Exam Browser access cookies. A random one is generated in `data/` if unset. |
-| `DATA_DIR` | Where the database and uploads live (default `./data`). Back this folder up. |
+4. Students see it on their dashboard, read the rules, and start.
+5. Educator: **Submissions**, then **Grade next**, then **Gradebook** and **Item analysis**. After grading file uploads, download what you need and delete the files to free space.
 
 ## Exam integrity: what it does and what it can't do
 
@@ -90,26 +180,30 @@ Item-writing tip: well-written distractors matter more than the number of choice
 ## Safe Exam Browser details
 
 - Teachers tick **Require Safe Exam Browser**, then save and publish. The editor shows the start link (`sebs://…/exams/<id>/config.seb`), a `.seb` download and the Config Key.
-- The config's start URL is `/exams/<id>/lockdown`. SEB for Windows sends `X-SafeExamBrowser-ConfigKeyHash`, which is checked directly. SEB for macOS and iOS (modern WebView) exposes the same value through its JavaScript API, which the page posts back for checking. On success the server sets a signed, 6-hour cookie for that user and exam, which is required to start the exam, save answers and submit.
+- The config's start URL is `/exams/<id>/lockdown`. SEB for Windows sends `X-SafeExamBrowser-ConfigKeyHash`, which is checked directly. SEB for macOS and iOS (modern WebView) exposes the same value through its JavaScript API, which the page posts back for checking. On success the server records a 6-hour pass in Firestore, tied to that user, exam and login session. The pass is required to start the exam, save answers and submit.
 - The Config Key implementation follows the [SEB specification](https://safeexambrowser.org/developer/seb-config-key.html). It's tested against two real SEB config files with known keys (from Moodle's test suite) in `tests/seb-config-key.test.ts`. Run it with `npm test`.
 
 ## Project layout
 
 ```
-app/                 Next.js App Router pages, server actions (app/actions.ts) and API routes
-components/          UI pieces; ExamRunner.tsx is the exam-taking client with integrity monitoring
-lib/db.ts            SQLite schema and helpers (node:sqlite)
-lib/exam.ts          Attempt building, randomization, auto-grading, deadlines
-lib/seb.ts           SEB config generation and Config Key algorithm
-lib/seb-access.ts    SEB request verification and signed access cookies
-lib/analysis.ts      Item analysis
-scripts/seed.ts      Demo data
-tests/               Unit tests (npm test)
-data/                Database and uploaded files (created at first run, git-ignored)
+app/                    Next.js App Router pages, server actions (app/actions.ts) and API routes
+components/             UI pieces; ExamRunner.tsx is the exam-taking client with integrity monitoring
+lib/db.ts               Firebase Admin setup, collection list and Firestore helpers
+lib/auth.ts             Session cookies from Firebase sign-in, roles
+lib/files.ts            Uploads stored as Firestore pieces, storage total, purge
+lib/exam.ts             Attempt building, randomization, auto-grading, deadlines
+lib/seb.ts              SEB config generation and Config Key algorithm
+lib/seb-access.ts       SEB request verification and lockdown passes
+lib/analysis.ts         Item analysis
+firestore.rules         Denies all direct browser access (the server uses the Admin SDK)
+firestore.indexes.json  Turns off indexes on large, never-queried fields
+vercel.json             Server region (Singapore)
+scripts/seed.ts         Demo data
+tests/                  Unit tests (npm test)
 ```
 
 ## Notes
 
-- Uploaded files are stored in `data/uploads` and are only downloadable by the student who uploaded them and the course's teachers.
-- Passwords are hashed with scrypt. Sessions are HTTP-only cookies.
-- `node:sqlite` prints an "experimental" warning on Node 22. It's stable for this use and the warning is harmless.
+- Uploaded files can be downloaded only by the student who uploaded them and the course's teachers.
+- Passwords are handled by Firebase Authentication. The app keeps a 14-day HTTP-only session cookie created by Firebase from a fresh sign-in, and signing out revokes it.
+- Tested end to end against the Firebase emulators with Playwright, on Pixel 7 and iPhone 13 sizes and a desktop browser: 39 checks covering quizzes, auto-grading, leave detection and auto-submit, uploads, photo shrinking, size and type limits, download permissions, grading, gradebook, purge, deadlines and the Safe Exam Browser gate.

@@ -1,5 +1,5 @@
 import { notFound } from "next/navigation";
-import { all } from "@/lib/db";
+import { where } from "@/lib/db";
 import { requireTeacher } from "@/lib/auth";
 import { getQuestion } from "@/lib/exam";
 import QuestionEditor from "@/components/QuestionEditor";
@@ -7,10 +7,10 @@ import QuestionEditor from "@/components/QuestionEditor";
 export default async function EditQuestion({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ back?: string }> }) {
   const { id } = await params;
   const { back } = await searchParams;
-  const q = getQuestion(Number(id));
+  const q = await getQuestion(id);
   if (!q) notFound();
   await requireTeacher(q.course_id);
-  const banks = all("SELECT id, title FROM banks WHERE course_id = ? ORDER BY title", q.course_id);
+  const banks = (await where("banks", ["course_id", "==", q.course_id])).map((b: any) => ({ id: b.id, title: b.title }));
   const safeBack = back && back.startsWith("/") && !back.startsWith("//") ? back : `/courses/${q.course_id}/bank`;
   return (
     <main className="wrap">
